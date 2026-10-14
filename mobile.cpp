@@ -17,6 +17,8 @@
 #include <commctrl.h>   // 滑块控件（音量）
 #include <windowsx.h>   // GET_X_LPARAM / GET_Y_LPARAM
 #include <shlobj.h>   // SHGetFolderPathW（取用户目录/桌面等路径）
+#include <gdiplus.h>  // 解码 Home.jpg / Home.png 当专辑封面（GDI+ 比 OleLoadPicturePath 稳）
+#pragma comment(lib, "gdiplus.lib")
 
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "gdi32.lib")
@@ -41,14 +43,38 @@ const int MINI_HEIGHT   = 56;    // 常驻小岛高度
 // ===== 迷你岛（1.1.13 加）：贴在屏幕顶边的"刘海"，只显示实时时间 =====
 // 顶边与屏幕边齐平（上两角不圆角），下两角圆角 —— 就像手机刘海那样挂在屏幕边上。
 // 用户要求：小岛只管倒计时，实时时间归迷你岛；迷你岛静止一段时间后降到半透明。
-const int NOTCH_WIDTH   = 150;   // 迷你岛宽度（只包住时间那点字，别留太多空）
-const int NOTCH_HEIGHT  = 48;    // 迷你岛高度（从屏幕顶边往下量）
-const int NOTCH_RADIUS  = 16;    // 下两角圆角半径
+const int NOTCH_WIDTH   = 150;   // 迷你岛宽度
+const int NOTCH_HEIGHT  = 48;    // 迷你岛高度
+// 迷你岛改成"悬浮"样式（2026-10-13 用户要求）：不再贴着屏幕顶边，而是像大岛/小岛那样浮在下面，
+// 只留 2 个像素的缝 —— 大改动是"四角都圆角"（原来上两角是直角）。
+// 好处是和大岛/小岛之间切换时形状不用变，视觉上顺得多；缝只有 2px，不仔细看还是"贴顶"的感觉。
+const int NOTCH_Y       = 2;     // 迷你岛距屏幕顶边的缝隙（用户要 1~2px）
 const int NOTCH_DIM_MS  = 10000; // 静止多久才降半透明
 const int NOTCH_DIM_A   = 115;   // 半透明程度（255=不透明；115 ≈ 45%）
 const int MINI_STEPS    = 46;    // 小岛弹出 / 小→大变身 的步数（46 帧，实测约 0.9s）
                                  // 注意：大→小变身不用它，用的是 ANIMATION_STEPS（与展开大岛同速率）
 const int HINT_GAP      = 30;    // 小岛下方"长按关闭常驻岛"那行字要占的高度
+
+// ===== 音乐播放器样式（放学《回家》在放的时候，大岛变成播放器）=====
+// 用户要求：只要一个最主要的"播放/暂停"键，不要歌词、不要进度条；
+// 版式 = 左边专辑封面(Home.jpg) + 中间歌名 + 右边播放/暂停键；
+// 整体是一个"比普通大岛大一圈的长方形"（长宽都加，主要加长）。
+const int PLAYER_W     = 640;    // 播放器岛宽（普通大岛是自适应 424 左右）
+const int PLAYER_H     = 124;    // 播放器岛高（普通大岛是 80）
+const int PLAYER_BTN_D = 60;     // 播放/暂停键直径
+const int PLAYER_PAD_R = 26;     // 按钮距离岛右边
+const int PLAYER_PAD_L = 22;     // 封面距离岛左边
+const int COVER_S      = 88;     // 专辑封面边长（正方形，居中裁切）
+const int COVER_RAD    = 16;     // 封面圆角半径
+const int PLAYER_LONG  = 600000; // 播放器定格时长（10 分钟，够放完一首；放完由 MM_MCINOTIFY 收掉）
+const int PLAYER_PAUSE_CLOSE_MS = 5000; // 按下暂停后超过 5 秒还没继续播 → 自动收掉播放器
+
+// ===== 麦克风 / 摄像头占用提示（2026-10-13 用户要求）=====
+// 侦测到麦克风或摄像头被占用 → 弹大岛提示："[图标] 麦克风被使用中"。
+// 图标是自绘的（左上角那个位置），岛宽跟着文字自适应，外面再给图标留出位置。
+const int PRIV_ICON_W = 34;      // 图标边长（按大岛高度缩放）
+const int PRIV_PAD_L  = 20;      // 图标距岛左边
+const int PRIV_GAP    = 14;      // 图标与文字之间的间距
 const int LONGPRESS_MS  = 800;   // 长按多久算长按
 const int SWIPE_HOLD_MS = 3000;  // 顶部下滑后停留多久展开常驻岛
 const int SWIPE_DY      = 60;    // 下滑多少像素才算"下滑"
@@ -63,7 +89,7 @@ struct AlarmTime {
     int hour, minute, second;
     AlarmType type;
     bool enabled;
-    int period;      // 属于第几个时段(0..PERIOD_COUNT-1)：排序后靠它跟菜单勾选对齐，别再用 i*2 猜
+    int period;      // 属于第几个时段(0..pc-1)：排序后靠它跟菜单勾选对齐，别再用 i*2 猜
 };
 
 // 画布尺寸：按动画过冲范围自动推导
@@ -75,7 +101,6 @@ HWND o     = NULL;
 // ---- 提醒音 ----
 wchar_t nn[MAX_PATH] = {0};   // alin.mp3 的绝对路径（空=没找到）
 bool    fuck  = true;             // 是否播放（托盘「提醒音」里可关）
-HWND    qq  = NULL;             // 音量设置小窗
 bool q = false;
 
 bool z = false;
@@ -105,12 +130,24 @@ static BYTE*    aa = NULL;
 static int      cc = 0;               // 画布缓存宽度（dd 原先存高度但从没被读过，已删）
 static std::map<int, HFONT> ee[2];
 
-// 时段名称（11个）
-const wchar_t* ff[] = {
+// 三套作息表，运行时切换（注册表 TimeTable：0=初四夏季 11 节 / 1=冬季 9 节 / 2=初四冬季 9 节）
+const wchar_t* ffA[] = {          // 初四夏季（含早读 / 午自习）
     L"早读", L"第1节课", L"第2节课", L"第3节课", L"第4节课",
     L"午自习", L"第5节课", L"第6节课", L"第7节课", L"课后服务1", L"课后服务2"
 };
-const int PERIOD_COUNT = 11;
+const wchar_t* ffB[] = {          // 冬季
+    L"第1节课", L"第2节课", L"第3节课", L"第4节课", L"第5节课",
+    L"第6节课", L"第7节课", L"课后服务1", L"课后服务2"
+};
+const wchar_t* ffC[] = {          // 初四冬季（第7/8/9 节与冬季不同，时间另算）
+    L"第1节课", L"第2节课", L"第3节课", L"第4节课", L"第5节课",
+    L"第6节课", L"第七节", L"第八节", L"第九节"
+};
+const wchar_t** ff = ffA;     // 当前用的名字表
+int  pc = 11;                 // 当前时段数（原 PERIOD_COUNT）
+int  tbl = 0;                 // 当前作息表：0=初四夏季 / 1=冬季 / 2=初四冬季
+void LoadTimeTable();
+void SaveTimeTable();
 
 wchar_t gg[128] = {0};
 bool hh = false;
@@ -137,6 +174,9 @@ int       nv = 255;                // 迷你岛当前的全局不透明度（降
 LONGLONG  na = 0;                  // 迷你岛"变活跃"的时刻，用来算多久后降半透明
 // 变身（J=5 缩小 / J=9 放大）的**目标**：这样六种方向（大↔小、大↔迷你、小↔迷你）共用同一套代码
 int       gw = MINI_WIDTH, gh = MINI_HEIGHT, gy = ISLAND_FINAL_Y, gJ = 7;
+// 大岛当前"应有的高度"：普通闹钟是 80，播放器是 124。
+// 弹出/收回/变身/画布尺寸都按它算，这样播放器才能长成一个更高的长方形。
+int       bigH = ISLAND_HEIGHT;
 float     vv = 0.0f;               // 文字交叉渐变：0=显示大岛文字，1=显示小岛文字
 int       ww = 0;                  // 提示文字("长按关闭常驻岛")的透明度 0~255
 bool      xx = false;              // 当前有按下（鼠标/触控）
@@ -147,20 +187,37 @@ int       ah = 0;                  // 手势起始 y
 bool      af = false;              // 提示文字是否该显示
 int       ab = 30;                 // 上课铃音量 0~100
 int       FUCK = 30;               // 下课铃音量 0~100（fuck=要不要响，FUCK=下课铃多响）
-HHOOK     ad = NULL;               // 低级鼠标钩子（用于全局检测下滑手势）
-int       aj = -1;                  // 音量面板正在拖的滑块（0=上课 1=下课 -1=没在拖）
 int       ai = -1;                  // 上次重绘用的"秒"（避免无谓重画）
 int       ae = 0, an = 0, ao = 0;   // 变身的**起始**尺寸/位置（从当前实际尺寸接着长，接缝处不跳变）
 float     vv0 = 0.0f, vt = 1.0f;    // 变身的起始/目标文字权重（大岛字=0，小岛字=1）
-bool      am = false;              // 钩子是否安装成功
+// ---- 音乐播放器 / 放学《回家》----
+// 这几个状态必须声明在 DrawIsland 之前（岛要按 bgmPause 画三角还是双竖条）
+bool      ply = false;              // 大岛是不是"播放器样式"（在放/暂停中；收回动画走完才清）
+float     plyA = 255.0f;            // 播放器内容的不透明度（"下课了 → 播放器"过渡时 0→255）
+bool      plyMix = false;           // 正在做"下课了 → 播放器"的过渡：ta/plyA 交给 J=9 的进度驱动
+LONGLONG  plyPauseAt = 0;           // 按下暂停的时刻（用来判"暂停 5 秒还没播就收掉"）
+// 麦克风/摄像头提示
+int       privKind = 0;             // 当前这条提示是哪种：0=不是隐私提示 1=麦克风 2=摄像头 3=两个都在
+int       privWant = 0;             // 挂着待弹的那条（岛正忙时先存着）
+bool      privWait = false;         // 有挂着的没弹出去
+bool      bgmOn = true;             // 是否播放《回家》（GUI 可关）
+int       bgmV  = 15;               // 《回家》音量 0~100，默认 15%
+bool      bgmPlay = false;          // 当前是否在播（MCI 已打开）
+bool      bgmPause = false;         // 暂停中（曲子还在，只是没往前走）
+RECT      plyBtn = {0,0,0,0};       // 播放/暂停键的屏幕矩形（命中测试用，每帧更新）
+BYTE*     covPx = NULL;             // 专辑封面解码后的预乘 BGRA（COVER_S×COVER_S），NULL=没有封面
+float     sf = 0.0f;                // 形状因子：0=普通圆角弹窗，1=吸顶刘海形
+float     sf0 = 0.0f, sf1 = 0.0f;   // 变身过程中的形状起止
 
 // 只有"岛形"那一块让窗口接收输入，其它地方一律穿透 —— 否则顶部 100px 会挡住下面窗口的点击
 bool IslandHitTest(POINT ptScreen)
 {
     if (J == 0 || F < 2 || G < 2) return false;
-    int lx = ptScreen.x - n;
-    int ly = ptScreen.y;
-    return (lx >= D && lx < D + F && ly >= E && ly < E + G);
+    // D/E 是岛在**屏幕坐标**下的左上角（画布里的位置是 D-n，见 DrawIsland 的 ox = D - n）。
+    // 这里以前写成 ptScreen.x - n 再跟 D 比 —— 多减了一个窗口偏移 n，
+    // 于是整个可点区域被右移了 n 像素（n 最多能到几百），大岛/小岛根本点不到。
+    return (ptScreen.x >= D && ptScreen.x < D + F &&
+            ptScreen.y >= E && ptScreen.y < E + G);
 }
 
 #define WM_ALARM_TRIGGER (WM_USER + 1)
@@ -174,9 +231,10 @@ bool IslandHitTest(POINT ptScreen)
 #define ID_NOTCH_TOGGLE    1032
 #define ID_TRAY_HOLIDAY    1017
 #define ID_TRAY_SETTINGS   1018
+#define ID_TBL_OLD         1040
+#define ID_TBL_WINTER      1041   // = 冬季作息
+#define ID_TBL_W4          1042   // = 初四冬季作息
 #define ID_TRAY_AUDIO_ON   1020
-#define ID_TRAY_AUDIO_VOL  1021
-#define ID_TRAY_UPDATENOTES 1008
 #define ID_PERIOD_BASE 2001
 #define ID_TIMER_RESHOW_MENU 99
 #define ID_TRAY_THEME_LIGHT 1010
@@ -186,6 +244,7 @@ bool IslandHitTest(POINT ptScreen)
 #define ID_TRAY_UNINSTALL 1016
 #define HOTKEY_ID_DEBUG 1
 #define HOTKEY_ID_SETTINGS 2
+#define HOTKEY_ID_PLAYER 3
 
 LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
 void CreateIslandWindow(HINSTANCE hInstance);
@@ -197,8 +256,6 @@ void RemoveTrayIcon(HWND hWnd);
 void ShowNextAlarmTime();
 void ToggleAutoStart();
 void TriggerAlarm(AlarmType type);
-void ShowUpdateNotes();
-void ShowUpdateNotesIfFirstRun();
 void UpdateIslandDisplay(HWND hWnd, float scale, BYTE alpha);
 void DrawIsland(BYTE* p, int stride, int width, int height);
 void CompositeGlyph(BYTE* p, const BYTE* mask, int stride, int x0, int y0, int x1, int y1, COLORREF color);
@@ -208,21 +265,29 @@ void AnimTick();
 LONGLONG NowMs();
 void LoadTheme();
 void SaveTheme();
-void ShowMessageIsland(const wchar_t* text);
+void ShowMessageIsland(const wchar_t* text, int extraW = 0);
+void ShowPlayerIsland();                   // 让大岛以"音乐播放器"样式出现并定格
+void PlayerTick();                         // 播放器的低频心跳（只负责那行提示淡出）
+void ClosePlayer();                        // 停音乐 + 收回播放器岛
+bool PlayerButtonHit(POINT ptScreen);      // 命中播放/暂停键 → 切一下
+void BgmToggle();                          // 播放 / 暂停
+void BgmStop();                            // 停掉并关掉播放器
 void LoadPeriodEnabled();
 void AudioPlay(AlarmType type);
+HICON AppIcon(bool small = false);
 void AudioPlayAsync(AlarmType type);       // 后台线程播放，不占 UI 线程
 void AudioStop();
 void AudioResolvePath();
 void LoadAudioCfg();
 void SaveAudioCfg();
-void ShowVolumeWindow(HWND owner);
 void SavePeriodEnabled();
 void LoadNotchCfg();
 void SaveNotchCfg();
 void SaveHolidayCfg();
 void ShowSettingsWindow(HWND owner);
 void ShowTrayMenu(HWND hWnd);
+void AlarmLabel(AlarmType t, wchar_t* out);
+void FitBigWidth(const wchar_t* label, const wchar_t* big, const wchar_t* extra, int extraPx = 0);
 void EnableDpiAwareness();
 DWORD GetOsBuild();
 
@@ -242,7 +307,6 @@ bool NextBreakTarget(LONGLONG* outTargetMs);
 bool PeriodEnabled(int i);
 void GestureTick();
 void PollGesture();
-LRESULT CALLBACK LowLevelMouseProc(int code, WPARAM wParam, LPARAM lParam);
 bool EnsureBuffers();
 void UpdateIslandDisplay(HWND hWnd, float scale, BYTE alpha);
 void AnimTick();
@@ -274,12 +338,12 @@ float springY(float t) { return springCurve(t, 4.5f, 11.5f); }  // 竖向位移�
 void ComputeCanvasSize()
 {
     float maxW = (float)g;
-    float maxBottom = (float)(ISLAND_FINAL_Y + ISLAND_HEIGHT);
+    float maxBottom = (float)(ISLAND_FINAL_Y + bigH);
     for (int i = 0; i <= 512; i++)
     {
         float t = i / 512.0f;
         float w = ISLAND_MIN_WIDTH  + (g - ISLAND_MIN_WIDTH) * springW(t);
-        float h = ISLAND_MIN_HEIGHT + (ISLAND_HEIGHT  - ISLAND_MIN_HEIGHT) * springH(t);
+        float h = ISLAND_MIN_HEIGHT + (bigH - ISLAND_MIN_HEIGHT) * springH(t);
         float y = ISLAND_FINAL_Y * springY(t);
         if (w > maxW) maxW = w;
         if (y + h > maxBottom) maxBottom = y + h;
@@ -287,10 +351,12 @@ void ComputeCanvasSize()
     j = (int)maxW + 8;
     l = (int)maxBottom + 8;
     if (j < g) j = g;
-    if (l < ISLAND_FINAL_Y + ISLAND_HEIGHT) l = ISLAND_FINAL_Y + ISLAND_HEIGHT;
+    if (l < ISLAND_FINAL_Y + bigH) l = ISLAND_FINAL_Y + bigH;
     // 常驻小岛 + 它下方那行提示文字也要完整画出来
     int miniBottom = ISLAND_FINAL_Y + MINI_HEIGHT + HINT_GAP;
     if (l < miniBottom) l = miniBottom;
+    // 大岛下面那行提示（长按关闭…）也要画得下
+    if (l < ISLAND_FINAL_Y + bigH + HINT_GAP) l = ISLAND_FINAL_Y + bigH + HINT_GAP;
     if (j > B) j = B;
     n = (B - j) / 2;
 }
@@ -381,6 +447,43 @@ const wchar_t* HolidayGreet()
 }
 const wchar_t* HolidayMark() { return HolidayToday() == 1 ? L" ●" : (HolidayToday() == 2 ? L" ★" : L""); }
 
+// 岛形覆盖率：一个函数画完"普通圆角矩形"到"吸在屏幕边缘的刘海形"的连续过渡
+//   sf=0 → 普通弹窗（四角圆角）；sf=1 → 迷你岛（上边齐平 + 顶边两侧向外拐的小圆弧）
+//   中间值给变身动画用，形状随 sf 平滑变形，收尾时不会再"咯噔"一下
+static inline float IslandCoverage(int lx, int ly, int w, int h, int rx, int ry, float sf)
+{
+    if (w <= 0 || h <= 0) return 0.0f;
+    int bx0 = 0, bx1 = w;                          // 主体就是整宽（外拐圆弧已去掉）
+    int topR = (int)(rx * (1.0f - sf) + 0.5f);     // 上两角：普通圆角 → 迷你岛时收成直角
+    float best;
+    {
+        float d = 0.0f;
+        if (lx < bx0) d = (float)(bx0 - lx);
+        else if (lx >= bx1) d = (float)(lx - bx1 + 1);
+        if (ly < 0) d = (float)(-ly);
+        else if (ly >= h) { float t = (float)(ly - h + 1); if (t > d) d = t; }
+        if (ry > 1 && ly >= h - ry && (lx < bx0 + ry || lx >= bx1 - ry))
+        {
+            int dx = (lx < bx0 + ry) ? (bx0 + ry - lx) : (lx - (bx1 - ry));
+            int dy = ly - (h - ry);
+            float v = (float)dx*dx/(float)(ry*ry) + (float)dy*dy/(float)(ry*ry);
+            if (v <= 1.0f) d = 0.0f;
+            else { float e = (sqrtf(v) - 1.0f) * (float)ry; if (e > d) d = e; }
+        }
+        if (topR > 1 && ly < topR && (lx < bx0 + topR || lx >= bx1 - topR))
+        {
+            int dx = (lx < bx0 + topR) ? (bx0 + topR - lx) : (lx - (bx1 - topR));
+            int dy = topR - ly;
+            float v = (float)dx*dx/(float)(topR*topR) + (float)dy*dy/(float)(topR*topR);
+            if (v <= 1.0f) d = 0.0f;
+            else { float e = (sqrtf(v) - 1.0f) * (float)topR; if (e > d) d = e; }
+        }
+        best = (d <= 0.0f) ? 1.0f : (d >= 1.5f ? 0.0f : 1.0f - d/1.5f);
+    }
+    if (best >= 1.0f) return 1.0f;
+    return best;
+}
+
 // 刘海形覆盖率：**顶边齐平**（上两角不圆角）、只有下两角圆角 —— 迷你岛专用
 static inline float NotchCoverage(int lx, int ly, int w, int h, int r)
 {
@@ -407,8 +510,7 @@ static inline float NotchCoverage(int lx, int ly, int w, int h, int r)
 // 圆角覆盖率，边界 1.5px 羽化
 static inline float ShapeCoverage(int lx, int ly, int w, int h, int rx, int ry)
 {
-    // 迷你岛（贴屏幕顶边的刘海）：上两角不圆角、只圆下两角 → 直接换一套形状
-    if (nt) return NotchCoverage(lx, ly, w, h, NOTCH_RADIUS);
+    return IslandCoverage(lx, ly, w, h, rx, ry, sf);
     if (w <= 0 || h <= 0) return 0.0f;
     float d = 0.0f;
     if (lx < 0) d = (float)(-lx);
@@ -470,8 +572,14 @@ DWORD GetOsBuild()
 
 bool EnsureBuffers()
 {
-    if (U && Y) return true;
     int W = j, H = l;
+    // 画布尺寸会随岛宽变化（大岛宽度自适应），尺寸一变就必须重建 DIB ——
+    // 否则 UpdateLayeredWindow 会读到缓冲区外面，屏幕上就是一块"随岛变大"的黑块
+    if ((U && Y) && cc == W) return true;
+    if (V) { DeleteObject(V); V = NULL; X = NULL; }
+    if (Z) { DeleteObject(Z); Z = NULL; aa = NULL; }
+    if (U) { DeleteDC(U); U = NULL; }
+    if (Y) { DeleteDC(Y); Y = NULL; }
     if (W < 2 || H < 2) return false;
     HDC hdcScreen = GetDC(NULL);
     BITMAPINFO bmi = {0};
@@ -543,6 +651,239 @@ void CompositeGlyph(BYTE* p, const BYTE* mask, int stride, int x0, int y0, int x
     }
 }
 
+// ===== 播放器按钮用的形状填充（同样按预乘 BGRA 混合）=====
+// 岛上原来只有文字，没有画过"面"。播放键要一个圆底 + 三角/双竖条，所以补三个填充原语。
+static inline void BlendPx(BYTE* p, int stride, int W, int H, int x, int y, COLORREF c, int a)
+{
+    if (a <= 0 || x < 0 || y < 0 || x >= W || y >= H) return;
+    BYTE* dp = p + ((size_t)y*stride + x)*4;
+    int sr=GetRValue(c), sg=GetGValue(c), sb=GetBValue(c);
+    int inv = 255 - a, dA = dp[3];
+    dp[0]=(BYTE)((sb*a + dp[0]*inv)/255);
+    dp[1]=(BYTE)((sg*a + dp[1]*inv)/255);
+    dp[2]=(BYTE)((sr*a + dp[2]*inv)/255);
+    dp[3]=(BYTE)(a + dA*inv/255);
+}
+
+static void FillDisc(BYTE* p, int stride, int W, int H, int cx, int cy, int r, COLORREF c, int a)
+{
+    for (int dy = -r; dy <= r; dy++)
+        for (int dx = -r; dx <= r; dx++)
+            if (dx*dx + dy*dy <= r*r)
+                BlendPx(p, stride, W, H, cx+dx, cy+dy, c, a);
+}
+
+// 右向三角（播放）。size = 高；宽约 0.82 倍，视觉重心稍微往右挪一点才看着居中
+static void FillPlayTri(BYTE* p, int stride, int W, int H, int cx, int cy, int size, COLORREF c, int a)
+{
+    int half = size / 2;
+    if (half < 1) half = 1;
+    int left = cx - size * 36 / 100;
+    for (int i = -half; i <= half; i++)
+    {
+        int wv = (int)((double)size * 0.82 * (1.0 - (double)(i < 0 ? -i : i) / (double)(half + 1)));
+        for (int x = 0; x < wv; x++)
+            BlendPx(p, stride, W, H, left + x, cy + i, c, a);
+    }
+}
+
+// 两条竖条（暂停）
+static void FillPauseBars(BYTE* p, int stride, int W, int H, int cx, int cy, int size, COLORREF c, int a)
+{
+    int bw = size / 4;
+    if (bw < 2) bw = 2;
+    int gap = size / 4;
+    int x0 = cx - (bw + gap / 2);
+    for (int k = 0; k < 2; k++)
+        for (int y = -size/2; y <= size/2; y++)
+            for (int x = 0; x < bw; x++)
+                BlendPx(p, stride, W, H, x0 + k*(bw+gap) + x, cy + y, c, a);
+}
+
+// ===== 专辑封面（Home.jpg）=====
+// 用 OLE 的图片解码（不引 GDI+）：解码一次缩成 COVER_S×COVER_S 的预乘 BGRA 缓存起来，
+// 之后每帧只是复制一段内存 —— 动画期间反复解码 JPEG 会明显掉帧。
+void CoverFree() { if (covPx) { free(covPx); covPx = NULL; } }
+
+bool CoverLoad()
+{
+    CoverFree();
+    wchar_t exe[MAX_PATH] = {0};
+    if (!GetModuleFileNameW(NULL, exe, MAX_PATH)) return false;
+    wchar_t* sl = wcsrchr(exe, L'\\');
+    if (!sl) return false;
+    sl[1] = 0;                                   // 只找 exe 同目录（和 Home.mp3 一个规矩）
+    const wchar_t* cand[] = { L"Home.jpg", L"Home.jpeg", L"Home.png", L"home.jpg", L"封面.jpg" };
+    Gdiplus::Bitmap* bm = NULL;
+    wchar_t p[MAX_PATH] = {0};
+    for (int i = 0; i < 5 && !bm; i++)
+    {
+        swprintf_s(p, L"%ls%ls", exe, cand[i]);
+        if (GetFileAttributesW(p) == INVALID_FILE_ATTRIBUTES) continue;
+        Gdiplus::Bitmap* t = Gdiplus::Bitmap::FromFile(p, FALSE);
+        if (t && t->GetLastStatus() == Gdiplus::Ok) bm = t;
+        else if (t) delete t;
+    }
+    if (!bm) return false;
+
+    bool ok = false;
+    UINT sw = bm->GetWidth(), sh = bm->GetHeight();
+    if (sw && sh)
+    {
+        // 居中裁成正方形再缩放：封面多半不是正方形，直接拉伸会变形
+        UINT side = (sw < sh) ? sw : sh;
+        UINT sx = (sw - side) / 2;
+        UINT sy = (sh - side) / 2;
+        Gdiplus::Bitmap out(COVER_S, COVER_S, PixelFormat32bppPARGB);   // 预乘 ARGB，正好是我们要的 BGRA
+        if (out.GetLastStatus() == Gdiplus::Ok)
+        {
+            Gdiplus::Graphics g(&out);
+            g.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
+            if (g.DrawImage(bm, Gdiplus::Rect(0, 0, COVER_S, COVER_S),
+                            (INT)sx, (INT)sy, (INT)side, (INT)side, Gdiplus::UnitPixel) == Gdiplus::Ok)
+            {
+                Gdiplus::Rect rc(0, 0, COVER_S, COVER_S);
+                Gdiplus::BitmapData bd;
+                if (out.LockBits(&rc, Gdiplus::ImageLockModeRead, PixelFormat32bppPARGB, &bd) == Gdiplus::Ok)
+                {
+                    covPx = (BYTE*)malloc((size_t)COVER_S * COVER_S * 4);
+                    if (covPx)
+                    {
+                        for (int y = 0; y < COVER_S; y++)
+                            memcpy(covPx + (size_t)y * COVER_S * 4,
+                                   (BYTE*)bd.Scan0 + (size_t)y * bd.Stride, (size_t)COVER_S * 4);
+                        ok = true;
+                    }
+                    out.UnlockBits(&bd);
+                }
+            }
+        }
+    }
+    delete bm;
+    if (!ok) CoverFree();
+    return ok;
+}
+
+// 把封面画到岛上（缩放到 s×s，四角圆角，和岛的风格一致）
+bool CoverBlit(BYTE* p, int stride, int W, int H, int x0, int y0, int s, int mul = 255)
+{
+    if (!covPx || s < 4 || mul <= 0) return false;
+    int r = COVER_RAD * s / COVER_S;
+    if (r > s / 2) r = s / 2;
+    for (int y = 0; y < s; y++)
+    {
+        int py = y0 + y;
+        if (py < 0 || py >= H) continue;
+        int sy = y * COVER_S / s; if (sy >= COVER_S) sy = COVER_S - 1;
+        for (int x = 0; x < s; x++)
+        {
+            int px = x0 + x;
+            if (px < 0 || px >= W) continue;
+            int cov = 255;
+            if (r > 0)
+            {
+                int dx = 0, dy = 0;
+                if      (x < r     && y < r    ) { dx = r - x;      dy = r - y; }
+                else if (x >= s - r && y < r    ) { dx = x - (s-r) + 1; dy = r - y; }
+                else if (x < r     && y >= s - r) { dx = r - x;      dy = y - (s-r) + 1; }
+                else if (x >= s - r && y >= s - r) { dx = x - (s-r) + 1; dy = y - (s-r) + 1; }
+                if (dx || dy)
+                {
+                    double d = sqrt((double)dx*dx + (double)dy*dy);
+                    cov = (int)(255.0 * (r - d) / r);
+                    if (cov < 0) cov = 0;
+                    if (cov > 255) cov = 255;
+                    if (cov == 0) continue;
+                }
+            }
+            int sx = x * COVER_S / s; if (sx >= COVER_S) sx = COVER_S - 1;
+            const BYTE* sp = covPx + ((size_t)sy * COVER_S + sx) * 4;
+            BYTE* dp = p + ((size_t)py * stride + px) * 4;
+            if (mul < 255) cov = cov * mul / 255;      // 过渡时整体淡入
+            int inv = 255 - cov;
+            dp[0] = (BYTE)((sp[0]*cov + dp[0]*inv) / 255);
+            dp[1] = (BYTE)((sp[1]*cov + dp[1]*inv) / 255);
+            dp[2] = (BYTE)((sp[2]*cov + dp[2]*inv) / 255);
+            dp[3] = (BYTE)((255*cov   + dp[3]*inv) / 255);
+        }
+    }
+    return true;
+}
+
+// ===== 隐私提示用的小图标（全自绘，和岛一样逐像素混合）=====
+// 全部按"设计尺寸 34×34"来写，实际乘 s/34 —— 这样弹出动画里图标会跟着岛一起长大。
+static void FillBoxPx(BYTE* p, int stride, int W, int H, int x0, int y0, int x1, int y1, COLORREF c, int a)
+{
+    if (x0 > x1) { int t = x0; x0 = x1; x1 = t; }
+    if (y0 > y1) { int t = y0; y0 = y1; y1 = t; }
+    for (int y = y0; y <= y1; y++)
+        for (int x = x0; x <= x1; x++)
+            BlendPx(p, stride, W, H, x, y, c, a);
+}
+
+// 圆角矩形的"有符号距离"：<0 在里面、=0 在边上、>0 在外面。
+// 有了它，"实心圆角矩形"和"圆角描边"就能共用一套代码。
+static double RoundRectSD(double px, double py, double x0, double y0, double x1, double y1, double r)
+{
+    double dx = std::max(std::max(x0 + r - px, px - (x1 - r)), 0.0);
+    double dy = std::max(std::max(y0 + r - py, py - (y1 - r)), 0.0);
+    return sqrt(dx*dx + dy*dy) - r;
+}
+// th < 0 → 实心；th >= 0 → 只画厚度 th 的描边
+static void FillRoundBoxPx(BYTE* p, int stride, int W, int H,
+                           double x0, double y0, double x1, double y1, double r, double th,
+                           COLORREF c, int a)
+{
+    for (int y = (int)floor(y0) - 1; y <= (int)ceil(y1) + 1; y++)
+        for (int x = (int)floor(x0) - 1; x <= (int)ceil(x1) + 1; x++)
+        {
+            double d = RoundRectSD(x + 0.5, y + 0.5, x0, y0, x1, y1, r);
+            if (d > 0.0) continue;
+            if (th >= 0.0 && d < -th) continue;
+            BlendPx(p, stride, W, H, x, y, c, a);
+        }
+}
+// 圆环（rIn=0 就是实心圆）；halfBottom=1 只画下半圈 —— 话筒那个托架就是它
+static void FillArcPx(BYTE* p, int stride, int W, int H,
+                      double cx, double cy, double rOut, double rIn, int halfBottom,
+                      COLORREF c, int a)
+{
+    for (int y = (int)(cy - rOut) - 1; y <= (int)(cy + rOut) + 1; y++)
+        for (int x = (int)(cx - rOut) - 1; x <= (int)(cx + rOut) + 1; x++)
+        {
+            double dx = x + 0.5 - cx, dy = y + 0.5 - cy;
+            double d2 = dx*dx + dy*dy;
+            if (d2 > rOut*rOut || d2 < rIn*rIn) continue;
+            if (halfBottom && dy < 0) continue;
+            BlendPx(p, stride, W, H, x, y, c, a);
+        }
+}
+
+// 麦克风：竖着的话筒头 + 下半圈托架 + 立柱 + 底座
+static void DrawMicIcon(BYTE* p, int stride, int W, int H, int x0, int y0, int s, COLORREF c, int a)
+{
+    double u = (double)s / 34.0;
+    if (u <= 0.0) return;
+    auto MX = [&](double v) { return x0 + v * u; };
+    auto MY = [&](double v) { return y0 + v * u; };
+    FillRoundBoxPx(p, stride, W, H, MX(12.5), MY(3),   MX(21.5), MY(21),  4.5*u, -1.0, c, a);   // 话筒头
+    FillArcPx(p, stride, W, H, MX(17), MY(20.5), 10.4*u, 8.1*u, 1, c, a);                       // 托架
+    FillBoxPx(p, stride, W, H, (int)MX(15.9), (int)MY(30.0), (int)MX(18.1), (int)MY(31.8), c, a);  // 立柱
+    FillBoxPx(p, stride, W, H, (int)MX(11.5), (int)MY(31.6), (int)MX(22.5), (int)MY(33.6), c, a);  // 底座
+}
+
+// 摄像头：顶部取景凸起 + 机身描边 + 镜头环
+static void DrawCamIcon(BYTE* p, int stride, int W, int H, int x0, int y0, int s, COLORREF c, int a)
+{
+    double u = (double)s / 34.0;
+    if (u <= 0.0) return;
+    auto CX = [&](double v) { return x0 + v * u; };
+    auto CY = [&](double v) { return y0 + v * u; };
+    FillRoundBoxPx(p, stride, W, H, CX(9.5), CY(4),  CX(22.5), CY(12),  2.2*u, -1.0, c, a);     // 取景凸起
+    FillRoundBoxPx(p, stride, W, H, CX(2),   CY(10), CX(32),   CY(29),  4.2*u, 2.2*u, c, a);    // 机身描边
+    FillArcPx(p, stride, W, H, CX(17), CY(19.5), 6.6*u, 4.3*u, 0, c, a);                        // 镜头环
+}
+
 // 弹出（大岛/小岛共用）：从最小尺寸长到目标尺寸，果冻过冲
 void PopTick(int tw, int th, int maxStep, int* step)
 {
@@ -560,19 +901,21 @@ void PopTick(int tw, int th, int maxStep, int* step)
 void ShowMiniIsland()
 {
     bb = true;
+    hh = false;          // 常驻岛不显示消息，否则 tBig=!hh 会把它画成空壳
     if (J == 5 || J == 6 || J == 7) return;
     if (J == 1 || J == 3 || J == 4 || J == 9 || J == 10) return;   // 大岛优先：等它走完/收完/变身完再接小岛
     if (J == 11 || J == 12)              // 迷你岛正挂着 → 直接变身成小岛，别先收再弹
     {
         nt = false; ae = F; an = G; ao = E;
         gw = MINI_WIDTH; gh = MINI_HEIGHT; gy = ISLAND_FINAL_Y; gJ = 7;
-        oo = 0; vv0 = 1.0f; vt = 1.0f;
+        oo = 0; vv0 = 1.0f; vt = 1.0f; sf0 = 1.0f; sf1 = 0.0f;
         J = 9;
         PrepareBackdropBeforeShow();
         R = NowMs();
         return;
     }
-    O = 0; vv = 1.0f; 
+    O = 0; vv = 1.0f;
+    sf = 0.0f; sf0 = 0.0f; sf1 = 0.0f;    // 小岛也是普通圆角，别把迷你岛的形状因子漏进来
     J = 6;
     PrepareBackdropBeforeShow();
     R = NowMs();
@@ -588,13 +931,38 @@ void HideMiniIsland()
         if (ns)                              // 迷你岛开着 → 直接缩成迷你岛，别先收掉再弹出来
         {
             nt = false; ae = F; an = G; ao = E;
-            gw = NOTCH_WIDTH; gh = NOTCH_HEIGHT; gy = 0; gJ = 12;
-            oo = 0; vv0 = 1.0f; vt = 1.0f;
+            gw = NOTCH_WIDTH; gh = NOTCH_HEIGHT; gy = NOTCH_Y; gJ = 12;
+            oo = 0; vv0 = 1.0f; vt = 1.0f; sf0 = sf; sf1 = 0.0f;
             J = 5;
         }
         else { J = 8; P = 0; }
         R = NowMs();
     }
+}
+
+// 迷你岛（刘海）的字号。
+// 共用公式是 fs = refH*0.62，迷你岛 refH=48 只出 29px 的字 —— 摆在 150×48 的刘海里太秀气。
+// 所以这里给它一个"等效高度"：先按高度取饱满，再量一次实际宽度往回缩，
+// 保证"22:02"加上节日记号也绝不会顶出刘海（这就是适配）。
+int NotchFontRef()
+{
+    int fs = (int)(NOTCH_HEIGHT * 0.95f);        // 高度上取饱满（原来共用 0.62 太保守）
+    SYSTEMTIME st; GetLocalTime(&st);
+    wchar_t t[32];
+    swprintf_s(t, L"%02d:%02d", st.wHour, st.wMinute);
+    const wchar_t* mk = HolidayMark();           // 中秋 ● / 国庆 ★ 也算进宽度里
+    if (mk[0]) wcscat_s(t, mk);
+    HDC dc = GetDC(NULL);
+    HGDIOBJ old = SelectObject(dc, GetCachedFont(fs, true));
+    SIZE s = {0,0};
+    GetTextExtentPoint32W(dc, t, (int)wcslen(t), &s);
+    SelectObject(dc, old);
+    ReleaseDC(NULL, dc);
+    int lim = NOTCH_WIDTH - 24;                  // 左右各留 12 的呼吸空间
+    if (s.cx > lim && s.cx > 0) fs = fs * lim / s.cx;
+    if (fs < 16) fs = 16;
+    int r = (int)(fs / 0.62f + 0.5f);            // 反推等效高度，喂给共用公式
+    return r;
 }
 
 // 画一帧
@@ -670,8 +1038,14 @@ void DrawIsland(BYTE* p, int stride, int width, int height)
 
     // 3. 文字：大岛文字 ↔ 小岛文字 交叉渐变（vv：0=大岛，1=小岛）
     int refH = ISLAND_HEIGHT;
-    if (J == 6 || J == 7 || J == 8) refH = MINI_HEIGHT;
-    else if (J == 5 || J == 9)      refH = (int)(ISLAND_HEIGHT + (MINI_HEIGHT - ISLAND_HEIGHT) * vv);
+    if (J == 6 || J == 7 || J == 8)            refH = MINI_HEIGHT;
+    else if (J == 11 || J == 12 || J == 13)    refH = NotchFontRef();   // 迷你岛：用"等效高度"喂字号
+    else if (J == 5 || J == 9)
+    {
+        // 变身：按"目标那一档"插值字号（目标是迷你岛就插到等效高度，别插到小岛的 56 再跳一下）
+        int toH = (sf1 > 0.5f) ? NotchFontRef() : MINI_HEIGHT;
+        refH = (int)(ISLAND_HEIGHT + (toH - ISLAND_HEIGHT) * vv);
+    }
     float fontScale;
     if (J == 1 || J == 4 || J == 6 || J == 8) fontScale = easeOutCubic(I);
     else                                      fontScale = 1.0f;
@@ -717,7 +1091,123 @@ void DrawIsland(BYTE* p, int stride, int width, int height)
         CompositeGlyph(p,(BYTE*)aa,stride,x0,y0,x1,y1,col,alpha);
     };
 
+    // 岛下方那行提示（白字黑描边，浮在桌面上也看得清）—— 常驻小岛与播放器共用同一套
+    auto hint=[&](const wchar_t* s){
+        if (ww <= 0 || G <= 2) return;
+        RECT hr = {ox, oy + h + 6, ox + w, oy + h + 6 + HINT_GAP - 8};
+        int off[4][2] = {{-1,0},{1,0},{0,-1},{0,1}};
+        for (int k = 0; k < 4; k++)
+        {
+            RECT r2 = hr;
+            r2.left += off[k][0]; r2.right += off[k][0];
+            r2.top  += off[k][1]; r2.bottom+= off[k][1];
+            stamp(r2, s, hFontHint, RGB(0,0,0), DT_CENTER|DT_TOP|DT_SINGLELINE, ww*3/4);
+        }
+        stamp(hr, s, hFontHint, RGB(255,255,255), DT_CENTER|DT_TOP|DT_SINGLELINE, ww);
+    };
+
     RECT shapeRect = {ox, oy, ox+w, oy+h};
+
+    // ===== 播放器样式 =====
+    // 放学《回家》在放（或在设置里试听）时，大岛不显示"下课了+时间"，而是变成播放器：
+    // 顶上一行状态小字 + 歌名大字 + 右边一个圆形的播放/暂停键。
+    // 用户明确：只要一个最主要的播放/暂停键，不要歌词、不要进度条。
+    // 判据里必须带 `bigH == PLAYER_H`：放学那一下大岛是按**普通高度**弹出来的，
+    // 那一刻要正常显示「下课了」+几点，不能抢着画播放器（否则封面会撑出岛外）。
+    if (ply && bigH == PLAYER_H && (J == 1 || J == 3 || J == 4 || J == 9) && plyA > 0)
+    {
+        int pa = (int)plyA;                             // 过渡中 0→255，配合 ta 做交叉淡入淡出
+        // 整体按"当前高度 / 播放器应有高度"缩放：弹出(J=1)是 0→1、变大(J=9)是 0.65→1、
+        // 收回(J=4)再缩回去 —— 这样封面和按钮不会在小岛上撑破。
+        float k = (float)G / (float)bigH;
+        if (k > 1.12f) k = 1.12f;
+        if (k < 0.05f) k = 0.05f;
+
+        int btnD  = (int)(PLAYER_BTN_D * k);  if (btnD  < 4) btnD  = 4;
+        int cs    = (int)(COVER_S      * k);  if (cs    < 4) cs    = 4;
+        int padL  = (int)(PLAYER_PAD_L * k);
+        int padR  = (int)(PLAYER_PAD_R * k);
+        int gap   = (int)(18 * k);
+
+        int bx = ox + w - padR - btnD;                  // 按钮左边界（画布坐标）
+        int by = oy + (h - btnD) / 2;
+        plyBtn.left   = n + bx;                         // 命中用屏幕坐标：屏幕 x = 画布 x + n
+        plyBtn.top    = by;                             // （y 不用加，窗口顶边就在屏幕顶边）
+        plyBtn.right  = n + bx + btnD;
+        plyBtn.bottom = by + btnD;
+
+        // ① 左：专辑封面（没有 Home.jpg 就不画，右边内容自动往左补）
+        int cx0 = ox + padL, cy0 = oy + (h - cs) / 2;
+        if (CoverBlit(p, stride, width, height, cx0, cy0, cs, pa))
+            cx0 += cs + gap;
+        else
+            cx0 = ox + 26;
+
+        // ② 中：歌名 + 状态小字
+        RECT tr = { cx0, oy, bx - gap, oy + h };
+        if (tr.right < tr.left + 20) tr.right = tr.left + 20;
+        HFONT fT = GetCachedFont(std::max(10, (int)(44 * k)), true);
+        HFONT fS = GetCachedFont(std::max(7,  (int)(19 * k)), false);
+        const wchar_t* song = L"《回家》";
+        const wchar_t* sts  = !bgmPlay ? L"未在播放" : (bgmPause ? L"已暂停" : L"正在播放");
+        RECT sr = { tr.left, oy + (int)(h * 0.14f), tr.right, oy + (int)(h * 0.46f) };
+        RECT gr = { tr.left, oy + (int)(h * 0.46f), tr.right, oy + (int)(h * 0.92f) };
+        RECT srh = sr, grh = gr;
+        srh.left += 1; srh.top += 1; grh.left += 2; grh.top += 2;
+        stamp(srh, sts,  fS, shadowColor, DT_LEFT|DT_VCENTER|DT_SINGLELINE, pa);
+        stamp(sr,  sts,  fS, textColor,   DT_LEFT|DT_VCENTER|DT_SINGLELINE, pa);
+        stamp(grh, song, fT, shadowColor, DT_LEFT|DT_VCENTER|DT_SINGLELINE, pa);
+        stamp(gr,  song, fT, textColor,   DT_LEFT|DT_VCENTER|DT_SINGLELINE, pa);
+
+        // ③ 右：播放 / 暂停圆钮
+        int ccx = bx + btnD/2, ccy = oy + h/2;
+        FillDisc(p, stride, width, height, ccx, ccy, btnD/2, textColor, 46 * pa / 255);
+        int gs = btnD * 42 / 100;
+        if (bgmPause) FillPlayTri  (p, stride, width, height, ccx, ccy, gs, textColor, pa);
+        else          FillPauseBars(p, stride, width, height, ccx, ccy, gs, textColor, pa);
+
+        // 只有"播放器彻底接管了"才提前收工；淡入途中要接着往下画，
+        // 让「下课了」那套普通内容（用 ta 控制透明度）跟播放器交叉淡入淡出。
+        if (plyA >= 255.0f)
+        {
+            hint(L"长按关闭播放器");
+            return;
+        }
+    }
+
+    // ===== 隐私提示：左边一个自绘图标（麦克风/摄像头），右边写字 =====
+    // 用户要的版式就是"左图标 + 右文字"；图标和文字一起随岛长大、跟着 ta 一起淡入淡出。
+    if (hh && privKind && !ply)
+    {
+        int pa = (int)(255.0f * std::max(0.0f, 1.0f - vv * 2.0f) * (ta / 255.0f));
+        if (pa <= 0) return;
+        float k = (float)G / (float)ISLAND_HEIGHT;      // 弹出/收回时按岛高整体缩放
+        if (k > 1.15f) k = 1.15f;
+        if (k < 0.05f) k = 0.05f;
+        int nIcon = (privKind == 3) ? 2 : 1;
+        int isz  = (int)(PRIV_ICON_W * k); if (isz < 5) isz = 5;
+        int padL = (int)(PRIV_PAD_L * k);
+        int gap  = (int)(PRIV_GAP * k);
+        int igap = (int)(10 * k);
+        int ix = ox + padL;
+        int iy = oy + (h - isz) / 2;
+        for (int n = 0; n < nIcon; n++)
+        {
+            // kind==1 只麦克风、==2 只摄像头、==3 两个并排（先麦克风后摄像头）
+            int one = (privKind == 3) ? (n == 0 ? 1 : 2) : privKind;
+            if (one == 1) DrawMicIcon(p, stride, width, height, ix, iy, isz, textColor, pa);
+            else          DrawCamIcon(p, stride, width, height, ix, iy, isz, textColor, pa);
+            ix += isz + igap;
+        }
+        ix += gap - igap;
+        HFONT fP = GetCachedFont(std::max(12, (int)(46 * k)), true);
+        RECT tr = { ix, oy, ox + w - 18, oy + h };
+        if (tr.right < tr.left + 20) tr.right = tr.left + 20;
+        RECT sh = tr; sh.top += 2; sh.left += 2;
+        stamp(sh, gg, fP, shadowColor, DT_LEFT|DT_VCENTER|DT_SINGLELINE, pa);
+        stamp(tr, gg, fP, textColor,   DT_LEFT|DT_VCENTER|DT_SINGLELINE, pa);
+        return;
+    }
 
     // 两端都是时间时只挪位置换字号，不能淡出淡入（会看着闪）→ 全程不透明、排版随 vv 插值
     bool tBig  = !hh;
@@ -739,11 +1229,7 @@ void DrawIsland(BYTE* p, int stride, int width, int height)
             // 顶行永远显示"事件"本身（上课了/下课了/时间到！）——
             // 节日祝福不在这里插队：那样会把"下课了"顶掉，跟"先显示下课、再出祝福"的两段式打架
             wchar_t infoStr[32];
-            switch(M){
-            case ALARM_TYPE_CLASS_START: wcscpy_s(infoStr,L"上课了");break;
-            case ALARM_TYPE_CLASS_END: wcscpy_s(infoStr,L"下课了");break;
-            default: wcscpy_s(infoStr,L"时间到！");break;
-            }
+            AlarmLabel(M, infoStr);
             RECT infoRect={shapeRect.left, oy, shapeRect.right, oy+(int)(h*0.28)};
             RECT infoSh=infoRect; infoSh.left+=1;infoSh.top+=1;infoSh.right+=1;infoSh.bottom+=1;
             stamp(infoSh,infoStr,hFontSmall,shadowColor,DT_CENTER|DT_TOP|DT_SINGLELINE,aBig);
@@ -765,11 +1251,7 @@ void DrawIsland(BYTE* p, int stride, int width, int height)
             // 顶行永远显示"事件"本身（上课了/下课了/时间到！）——
             // 节日祝福不在这里插队：那样会把"下课了"顶掉，跟"先显示下课、再出祝福"的两段式打架
             wchar_t infoStr[32];
-            switch(M){
-            case ALARM_TYPE_CLASS_START: wcscpy_s(infoStr,L"上课了");break;
-            case ALARM_TYPE_CLASS_END: wcscpy_s(infoStr,L"下课了");break;
-            default: wcscpy_s(infoStr,L"时间到！");break;
-            }
+            AlarmLabel(M, infoStr);
             RECT infoRect={shapeRect.left, oy, shapeRect.right, oy+(int)(h*0.28)};
             RECT infoSh=infoRect; infoSh.left+=1;infoSh.top+=1;infoSh.right+=1;infoSh.bottom+=1;
             stamp(infoSh,infoStr,hFontSmall,shadowColor,DT_CENTER|DT_TOP|DT_SINGLELINE,aBig);
@@ -797,21 +1279,8 @@ void DrawIsland(BYTE* p, int stride, int width, int height)
         stamp(mr,miniStr,hFontLarge,textColor,DT_CENTER|DT_VCENTER|DT_SINGLELINE,aMini);
     }
 
-    // 3c) 小岛下方那行提示：不加背景，白字黑描边（浮在桌面上也看得清）
-    if (ww > 0 && G > 2)
-    {
-        RECT hr = {ox, oy + h + 6, ox + w, oy + h + 6 + HINT_GAP - 8};
-        const wchar_t* hintStr = L"长按关闭常驻岛";
-        int off[4][2] = {{-1,0},{1,0},{0,-1},{0,1}};
-        for (int k = 0; k < 4; k++)
-        {
-            RECT r2 = hr;
-            r2.left += off[k][0]; r2.right += off[k][0];
-            r2.top  += off[k][1]; r2.bottom+= off[k][1];
-            stamp(r2, hintStr, hFontHint, RGB(0,0,0), DT_CENTER|DT_TOP|DT_SINGLELINE, ww*3/4);
-        }
-        stamp(hr, hintStr, hFontHint, RGB(255,255,255), DT_CENTER|DT_TOP|DT_SINGLELINE, ww);
-    }
+    // 3c) 岛下方那行提示（播放器/淡入途中说"关闭播放器"，其余说"关闭常驻岛"）
+    hint((ply && bigH == PLAYER_H) ? L"长按关闭播放器" : L"长按关闭常驻岛");
 }
 
 // 把画布内容提交给窗口
@@ -822,6 +1291,14 @@ void UpdateIslandDisplay(HWND hWnd, float scale, BYTE alpha)
     if (!EnsureBuffers()) return;
 
     DrawIsland(X, cc, j, l);
+
+    // 窗口尺寸先跟画布对齐，再交画面：某些环境里"窗口尺寸 ≠ 源画布尺寸"就会带出一条黑边
+    static int lj = -1, ll = -1, ln = -1;
+    if (j != lj || l != ll || n != ln)
+    {
+        SetWindowPos(hWnd, HWND_TOPMOST, n, 0, j, l, SWP_NOACTIVATE);
+        lj = j; ll = l; ln = n;
+    }
 
     BYTE ga = nt ? (BYTE)nv : (BYTE)255;      // 迷你岛降到半透明；其它岛恒不透明
     BLENDFUNCTION blend={AC_SRC_OVER,0,ga,AC_SRC_ALPHA};
@@ -835,11 +1312,26 @@ void UpdateIslandDisplay(HWND hWnd, float scale, BYTE alpha)
 void LoadAlarmTimes()
 {
     jj.clear();
-    int startH[] = {7,8,9,10,11,12,14,15,15,16,17};
-    int startM[] = {15,0,0,15,10,30,0,0,55,45,35};
-    int endH[]   = {7,8,9,11,11,13,14,15,16,17,18};
-    int endM[]   = {55,45,45,0,55,15,45,45,40,25,15};
-    for (int i=0;i<11;i++)
+    // 旧版（11 节，含早读 / 午自习）
+    static const int hA[]  = { 7, 8, 9,10,11,12,14,15,15,16,17};
+    static const int mA[]  = {15, 0, 0,15,10,30, 0, 0,55,45,35};
+    static const int hAe[] = { 7, 8, 9,11,11,13,14,15,16,17,18};
+    static const int mAe[] = {55,45,45, 0,55,15,45,45,40,25,15};
+    // 冬季（9 节，第1节 8:00 起，午休不排时段）
+    static const int hB[]  = { 8, 9,10,11,13,14,15,16,17};
+    static const int mB[]  = { 0, 0,15,10,30,30,45,40,30};
+    static const int hBe[] = { 8, 9,11,11,14,15,16,17,18};
+    static const int mBe[] = {45,45, 0,55,15,15,30,20,10};
+    // 初四冬季（9 节；第7/8/9 节 = 15:25-16:10 / 16:15-16:55 / 17:05-17:45）
+    static const int hC[]  = { 8, 9,10,11,13,14,15,16,17};
+    static const int mC[]  = { 0, 0,15,10,30,30,25,15, 5};
+    static const int hCe[] = { 8, 9,11,11,14,15,16,16,17};
+    static const int mCe[] = {45,45, 0,55,15,15,10,55,45};
+    const int* startH = tbl == 1 ? hB : (tbl == 2 ? hC : hA);
+    const int* startM = tbl == 1 ? mB : (tbl == 2 ? mC : mA);
+    const int* endH   = tbl == 1 ? hBe : (tbl == 2 ? hCe : hAe);
+    const int* endM   = tbl == 1 ? mBe : (tbl == 2 ? mCe : mAe);
+    for (int i=0;i<pc;i++)
     {
         AlarmTime s,e;
         s.hour=startH[i];s.minute=startM[i];s.second=0;s.type=ALARM_TYPE_CLASS_START;s.enabled=true;s.period=i;
@@ -962,26 +1454,47 @@ static bool EnsureInstalledOrRun()
     wchar_t exe[MAX_PATH];
     swprintf_s(exe, L"%ls\\islands.exe", dir);
 
-    if (GetFileAttributesW(exe) != INVALID_FILE_ATTRIBUTES) return true; // 已安装过 → 正常运行
-    if (_wcsicmp(self, exe) == 0) return true;                          // 正从安装目录运行
+    bool done = (GetFileAttributesW(exe) != INVALID_FILE_ATTRIBUTES)      // 已安装过 → 正常运行
+             || (_wcsicmp(self, exe) == 0);                              // 正从安装目录运行
 
-    // 首次运行 → 装一下
-    CreateDirectoryW(dir, NULL);
-    if (!CopyFileW(self, exe, FALSE)) return true;                      // 复制失败则按便携版运行
-    {   // 提醒音也跟着搬过去（用户把 alin.mp3 放在原 exe 旁边即可）
-        wchar_t from[MAX_PATH] = {0}, to[MAX_PATH] = {0};
-        wcscpy_s(from, self);
-        wchar_t* sl = wcsrchr(from, L'\\');
+    if (!done)
+    {   // 首次运行 → 装一下
+        CreateDirectoryW(dir, NULL);
+        if (!CopyFileW(self, exe, FALSE)) return true;                   // 复制失败则按便携版运行
+    }
+
+    // 音频随行：每次启动都补一次，别只认首次安装。
+    // 理由（踩过）：装了以后用户才把 Home.mp3 放到 exe 旁边 —— 老逻辑在"已安装"那行就 return 了，
+    // 永远搬不进去，放学音乐就一辈子不响。已存在的文件不覆盖，所以用户自己换过的音频不会被冲掉。
+    // 注意要搬 alin.mp3（提醒音）和 Home.mp3（放学《回家》）两类，别只搬一个。
+    const wchar_t* aud[8] = { L"alin.mp3", L"Home.mp3", L"Home.wav", L"home.mp3", L"回家.mp3",
+                              L"Home.jpg", L"Home.png", L"home.jpg" };
+    {
+        wchar_t base[MAX_PATH] = {0};
+        wcscpy_s(base, self);
+        wchar_t* sl = wcsrchr(base, L'\\');
         if (sl)
         {
-            *(sl + 1) = 0;
-            wcscat_s(from, L"alin.mp3");
-            swprintf_s(to, L"%ls\\alin.mp3", dir);
-            if (GetFileAttributesW(from) != INVALID_FILE_ATTRIBUTES &&
-                GetFileAttributesW(to) == INVALID_FILE_ATTRIBUTES)
-                CopyFileW(from, to, FALSE);
+            *(sl + 1) = 0;      // 截到最后一个反斜杠后：base 就是"原 exe 所在目录"（末尾带分隔符）
+            // 注意：注释千万不能用反斜杠结尾 —— 那是"续行符"，会把下一行代码吞进注释（这里栽过）
+            // ⚠️ 这个上限必须跟上面 aud[] 的元素个数一致。原来写的是 5，而数组有 8 个，
+            // 结果 Home.jpg / Home.png / home.jpg **永远搬不进去** —— 自安装之后播放器就没封面了
+            // （测试时是直接往安装目录里拷的封面，所以没暴露）。
+            for (int i = 0; i < 8; i++)
+            {
+                wchar_t from[MAX_PATH] = {0};
+                wchar_t to[MAX_PATH] = {0};
+                swprintf_s(from, L"%ls%ls", base, aud[i]);
+                swprintf_s(to, L"%ls\\%ls", dir, aud[i]);
+                if (_wcsicmp(from, to) == 0) continue;                    // 本来就在安装目录里跑
+                if (GetFileAttributesW(from) != INVALID_FILE_ATTRIBUTES &&
+                    GetFileAttributesW(to) == INVALID_FILE_ATTRIBUTES)
+                    CopyFileW(from, to, FALSE);
+            }
         }
     }
+
+    if (done) return true;
 
     wchar_t cmd[MAX_PATH + 4];
     swprintf_s(cmd, L"\"%ls\"", exe);
@@ -1003,7 +1516,7 @@ void AnimTick()
         if (t > 1.0f) t = 1.0f;
         I = t;
         F  = (int)(ISLAND_MIN_WIDTH  + (g - ISLAND_MIN_WIDTH) * springW(t));
-        G = (int)(ISLAND_MIN_HEIGHT + (ISLAND_HEIGHT  - ISLAND_MIN_HEIGHT) * springH(t));
+        G = (int)(ISLAND_MIN_HEIGHT + (bigH - ISLAND_MIN_HEIGHT) * springH(t));
         E      = (int)(ISLAND_FINAL_Y * springY(t));
         D      = (B - F) / 2;
         O++;
@@ -1011,7 +1524,7 @@ void AnimTick()
         {
             O = 0;
             F  = g;
-            G = ISLAND_HEIGHT;
+            G = bigH;                 // 普通闹钟 80 / 播放器 124
             E      = ISLAND_FINAL_Y;
             D      = (B - g) / 2;
             I = 1.0f;
@@ -1046,12 +1559,13 @@ void AnimTick()
         E = (int)(ao + (gy - ao) * springY(t));
         D = (B - F) / 2;
         vv = vv0 + (vt - vv0) * t;
+        sf = sf0 + (sf1 - sf0) * t;
         oo++;
         if (oo > ANIMATION_STEPS)
         {
             oo = 0;
             F = gw; G = gh; E = gy; D = (B - F) / 2;
-            vv = vt;
+            vv = vt; sf = sf1;
             J = gJ;
             if (J == 12) { nt = true; na = NowMs(); nv = 255; ai = -1; }   // 落到迷你岛
         }
@@ -1068,12 +1582,23 @@ void AnimTick()
         E = (int)(ao + (gy - ao) * springY(t));
         D = (B - F) / 2;
         vv = vv0 + (vt - vv0) * t;
+        sf = sf0 + (sf1 - sf0) * t;
+        if (plyMix)
+        {
+            // 「下课了」→ 播放器：前 40% 旧字先淡出，后 65% 播放器再淡入（直接对切会显得糊）。
+            // 两段重叠一点，看起来才像"换了个版面"而不是"闪了一下"。
+            float outT = t / 0.40f;             if (outT > 1.0f) outT = 1.0f;
+            float inT  = (t - 0.35f) / 0.65f;   if (inT < 0.0f) inT = 0.0f; if (inT > 1.0f) inT = 1.0f;
+            ta   = (int)(255.0f * (1.0f - outT));
+            plyA = 255.0f * inT;
+        }
         oo++;
         if (oo > MINI_STEPS)
         {
             oo = 0;
             F = gw; G = gh; E = gy; D = (B - F) / 2;
-            vv = vt;
+            vv = vt; sf = sf1;
+            if (plyMix) { plyMix = false; ta = 255; plyA = 255.0f; }   // 过渡结束，播放器完全接管
             J = gJ;
             if (J == 3) S = NowMs() + DISPLAY_DURATION_MS;   // 变身完 → 照常定格显示大岛
             if (J == 7) { vv = 1.0f; }                       // 落到小岛
@@ -1087,14 +1612,14 @@ void AnimTick()
         if (t > 1.0f) t = 1.0f;
         F = (int)(ISLAND_MIN_WIDTH  + (NOTCH_WIDTH  - ISLAND_MIN_WIDTH ) * springW(t));
         G = (int)(ISLAND_MIN_HEIGHT + (NOTCH_HEIGHT - ISLAND_MIN_HEIGHT) * springH(t));
-        E = (int)(-NOTCH_HEIGHT * (1.0f - springY(t)));
+        E = (int)((NOTCH_Y + NOTCH_HEIGHT) * springY(t)) - NOTCH_HEIGHT;   // 从屏幕上方落到位（离顶 NOTCH_Y）
         D = (B - F) / 2;
-        vv = 1.0f;
+        vv = 1.0f; sf = 0.0f;                                                // 迷你岛也是四角圆角
         O++;
         if (O > MINI_STEPS)
         {
             O = 0;
-            F = NOTCH_WIDTH; G = NOTCH_HEIGHT; E = 0; D = (B - F) / 2;
+            F = NOTCH_WIDTH; G = NOTCH_HEIGHT; E = NOTCH_Y; D = (B - F) / 2;
             nt = true; nv = 255; na = NowMs(); ai = -1;
             J = 12;
         }
@@ -1107,12 +1632,13 @@ void AnimTick()
         if (t < 0.0f) t = 0.0f;
         F = (int)(ISLAND_MIN_WIDTH  + (NOTCH_WIDTH  - ISLAND_MIN_WIDTH ) * springW(t));
         G = (int)(ISLAND_MIN_HEIGHT + (NOTCH_HEIGHT - ISLAND_MIN_HEIGHT) * springH(t));
-        E = (int)(-NOTCH_HEIGHT * (1.0f - springY(t)));
+        E = (int)((NOTCH_Y + NOTCH_HEIGHT) * springY(t)) - NOTCH_HEIGHT;   // 反向：缩回屏幕上方
         D = (B - F) / 2;
+        sf = 0.0f;
         P++;
         if (P > MINI_STEPS)
         {
-            P = 0; nt = false; J = 0;
+            P = 0; nt = false; sf = 0.0f; J = 0;
             {   // 刚收掉迷你岛，若此刻正处课间 → 把倒计时的常驻小岛补上
                 LONGLONG t0 = 0;
                 if (BreakInfoActive(&t0)) { pp = true; rr = t0; bb = true; O = 0; vv = 1.0f; J = 6; }
@@ -1126,9 +1652,10 @@ void AnimTick()
         //   ① 先维持"下课了 + 时间" ② 文字渐渐淡出 ③ 换文案 ④ 「国庆节快乐」淡入 ⑤ 停一会儿再收回
         hs++;
         if (hs <= 24)        ta = 255 - 255 * hs / 24;                             // 淡出 ≈0.5s
-        else if (hs == 25) { hh = true; wcscpy_s(gg, HolidayGreet()); ta = 0; }    // 换文案
+        else if (hs == 25) { hh = true; wcscpy_s(gg, HolidayGreet()); ta = 0; FitBigWidth(NULL, gg, NULL); }    // 换文案
         else if (hs <= 55)   ta = 255 * (hs - 25) / 30;                            // 淡入 ≈0.6s
         else if (hs <= 190)  ta = 255;                                             // 停留 ≈3s
+        else if (ply)      { ta = 255; hh = false; J = 3; ShowPlayerIsland(); }    // 祝福演完 → 接手播音乐
         else               { ta = 255; hh = false; P = 0; J = 4; }                 // 收回
         UpdateIslandDisplay(o, 1.0f, 255);
     }
@@ -1166,22 +1693,29 @@ void AnimTick()
         float k = 1.0f - p;
         E      = (int)(ISLAND_FINAL_Y * k);
         F  = (int)(g * k);
-        G = (int)(ISLAND_HEIGHT  * k);
+        G = (int)(bigH * k);
         D      = (B - F) / 2;
         P++;
         if (P > SLIDEOUT_STEPS)
         {
             P = 0;
+            // 播放器岛在收回这段要一直保持"播放器内容"（不然会闪一下普通闹钟的字），到这儿才真正结束
+            if (ply) { ply = false; ww = 0; af = false; }
+            plyA = 255.0f; plyMix = false; ta = 255;     // 过渡状态一并清干净
+            if (bigH != ISLAND_HEIGHT) { bigH = ISLAND_HEIGHT; ComputeCanvasSize(); }
             if (bb)                       // 收回结束时小岛还在等 → 直接接着弹小岛
             {
-                O = 0; vv = 1.0f; 
+                hh = false;                           // 别带着消息标志进小岛（会画成空壳）
+                O = 0; vv = 1.0f;
+                sf = 0.0f; sf0 = 0.0f; sf1 = 0.0f;   // 小岛＝普通圆角
                 J = 6; R = NowMs();
                 return;
             }
             if (ns)                       // 没有小岛等着、但迷你岛开着 → 挂成迷你岛
             {
                 nt = true; nv = 255; na = NowMs(); ai = -1; O = 0;
-                vv = 1.0f; vv0 = 1.0f; vt = 1.0f;
+                hh = false;                           // 别带着消息标志进迷你岛
+                vv = 1.0f; vv0 = 1.0f; vt = 1.0f; sf = 0.0f;   // 迷你岛＝四角圆角（悬浮样式）
                 J = 11; R = NowMs();
                 return;
             }
@@ -1224,14 +1758,14 @@ bool BreakInfoActive(LONGLONG* outTargetMs)
     int nowSec = st.wHour*3600 + st.wMinute*60 + st.wSecond;
     int minNow = st.wHour*60 + st.wMinute;
     LONGLONG base = NowMs() - (LONGLONG)nowSec*1000 - (LONGLONG)st.wMilliseconds;   // 今天零点
-    for (int i = 0; i + 1 < PERIOD_COUNT; i++)
+    for (int i = 0; i + 1 < pc; i++)
     {
         int eh, em, nh, nm;
         if (!GetPeriodTime(i, ALARM_TYPE_CLASS_END,   &eh, &em)) continue;
         if (!GetPeriodTime(i + 1, ALARM_TYPE_CLASS_START, &nh, &nm)) continue;
         int endMin = eh*60 + em, nextMin = nh*60 + nm;
         if (nextMin <= endMin) continue;                       // 跨天/异常，忽略
-        if (i == 4) continue;                                  // 中午那段（第4节下课→午自习）不显示倒计时，用户要求
+        if (nextMin - endMin > 45) continue;                   // 长课间（午休）不显示倒计时
         // 注意：这里**故意不看 PeriodEnabled** —— 倒计时（显示）与铃声（打钩）是两码事：
         // 用户要求"每个课间都显示倒计时，但不必每个课间都响铃"，所以没打钩的时段也照样显示倒计时
         if (minNow >= endMin && minNow < nextMin)
@@ -1250,12 +1784,12 @@ bool NextBreakTarget(LONGLONG* outTargetMs)
     int nowSec = st.wHour*3600 + st.wMinute*60 + st.wSecond;
     int minNow = st.wHour*60 + st.wMinute;
     LONGLONG base = NowMs() - (LONGLONG)nowSec*1000 - (LONGLONG)st.wMilliseconds;
-    for (int i = 0; i + 1 < PERIOD_COUNT; i++)
+    for (int i = 0; i + 1 < pc; i++)
     {
         int eh, em, nh, nm;
         if (!GetPeriodTime(i, ALARM_TYPE_CLASS_END,   &eh, &em)) continue;
         if (!GetPeriodTime(i + 1, ALARM_TYPE_CLASS_START, &nh, &nm)) continue;
-        if (i == 4) continue;                                  // 中午那段同样不算
+        if (nh*60 + nm - (eh*60 + em) > 45) continue;          // 长课间（午休）不算
         if (eh*60 + em == minNow && nh*60 + nm > minNow)
         {
             *outTargetMs = base + (LONGLONG)(nh*60 + nm)*60*1000;
@@ -1268,6 +1802,7 @@ bool NextBreakTarget(LONGLONG* outTargetMs)
 // 常驻小岛心跳（约 33ms）：刷倒计时 / 课间结束就收 / 提示淡入淡出 / 到秒才重绘
 void MiniHoldTick()
 {
+    hh = false;          // 兜底：常驻岛期间一律按"不是消息"画
     LONGLONG tgt = 0;
     bool brk = BreakInfoActive(&tgt);
     if (brk)
@@ -1329,13 +1864,20 @@ void PollGesture()
 // 交互心跳（约 100ms）：长按判满 → 关掉常驻小岛；下滑后停留够 3 秒 → 展开常驻小岛
 void GestureTick()
 {
-    if (!am) PollGesture();
+    PollGesture();
     LONGLONG now = NowMs();
 
     if (xx && (J == 6 || J == 7) && now - yy >= LONGPRESS_MS)
     {
         xx = false; af = false;                     // 长按关闭
         HideMiniIsland();
+    }
+    // 播放器岛：长按 → 停掉《回家》并收回（用户只要求有播放/暂停键，所以长按是它的退出方式，
+    // 和"长按关闭常驻岛"是同一套手势，不额外加按钮）
+    if (xx && ply && (J == 1 || J == 3) && now - yy >= LONGPRESS_MS)
+    {
+        xx = false; af = false;
+        ClosePlayer();
     }
     if (zz && now - ag >= SWIPE_HOLD_MS)
     {
@@ -1348,38 +1890,9 @@ void GestureTick()
         }
         else if (now - ag > SWIPE_HOLD_MS + 5000) zz = false;   // 兜底，别一直挂着
     }
-    if (!(xx || zz || !am)) KillTimer(o, 12);          // 没活儿了就停心跳
+    if (!xx && !zz) KillTimer(o, 12);                  // 没活儿了就停心跳
 }
 
-// 低级鼠标钩子：全局捕获按下（不拦截事件），用于"顶部下滑"手势
-LRESULT CALLBACK LowLevelMouseProc(int code, WPARAM wParam, LPARAM lParam)
-{
-    if (code == HC_ACTION)
-    {
-        MSLLHOOKSTRUCT* m = (MSLLHOOKSTRUCT*)lParam;
-        POINT pt = { (int)m->pt.x, (int)m->pt.y };
-        if (wParam == WM_LBUTTONDOWN)
-        {
-            if (IslandHitTest(pt))
-            {
-                if (!xx) { xx = true; yy = NowMs(); af = true; }
-                SetTimer(o, 12, 100, NULL);
-            }
-            else
-            {
-                int cxm = B / 2;
-                if (J == 0 && pt.y <= 40 && pt.x > cxm - g / 2 && pt.x < cxm + g / 2)
-                { zz = true; ag = NowMs(); ah = pt.y; SetTimer(o, 12, 100, NULL); }
-            }
-        }
-        else if (wParam == WM_LBUTTONUP)
-        {
-            if (xx) { xx = false; af = false; }
-            if (zz) zz = false;
-        }
-    }
-    return CallNextHookEx(NULL, code, wParam, lParam);
-}
 
 void StartTimerThread()
 {
@@ -1468,6 +1981,85 @@ void AudioResolvePath()
 
 // MCI 播 mp3：系统自带解码器，支持音量 0~1000
 // 播 mp3。找不到文件就闭嘴，绝不弹框打扰（上课呢）
+// 程序自己的图标（资源里那个 1 ICON）：托盘 / 任务栏 / 标题栏 都用它
+HICON AppIcon(bool small)
+{
+    static HICON big = NULL, sml = NULL;
+    HINSTANCE hi = GetModuleHandleW(NULL);
+    if (small)
+    {
+        if (!sml) sml = (HICON)LoadImageW(hi, MAKEINTRESOURCEW(1), IMAGE_ICON,
+                                          GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), 0);
+        if (!sml) sml = LoadIcon(NULL, IDI_APPLICATION);
+        return sml;
+    }
+    if (!big) big = LoadIconW(hi, MAKEINTRESOURCEW(1));
+    if (!big) big = LoadIcon(NULL, IDI_APPLICATION);
+    return big;
+}
+
+// ===== 放学 BGM《回家》：同目录找 Home.mp3 / Home.wav（没有就安静地不播）=====
+// 状态量都声明在文件上方（DrawIsland 要用），这里只有路径和几个动作函数
+wchar_t bgmPath[MAX_PATH] = {0};
+// 《回家》的播放时刻：固定 19:30（2026-10-13 用户要求 —— 从"放学那一下"挪出来，放学恢复打铃）
+const int BGM_HOUR = 19;
+const int BGM_MIN  = 30;
+int  nb = -1;                      // 上次处理过的分钟；每分钟跟着走，用于"到点只放一次"
+
+void HomeResolvePath()
+{
+    bgmPath[0] = 0;
+    wchar_t exe[MAX_PATH] = {0};
+    if (!GetModuleFileNameW(NULL, exe, MAX_PATH)) return;
+    wchar_t* slash = wcsrchr(exe, L'\\');
+    if (!slash) return;
+    slash[1] = 0;
+    const wchar_t* cand[] = { L"Home.mp3", L"Home.wav", L"home.mp3", L"回家.mp3" };
+    for (int i = 0; i < 4; i++)
+    {
+        swprintf_s(bgmPath, L"%ls%ls", exe, cand[i]);
+        if (GetFileAttributesW(bgmPath) != INVALID_FILE_ATTRIBUTES) return;
+    }
+    bgmPath[0] = 0;
+}
+void BgmStop()
+{
+    if (!bgmPlay) return;
+    mciSendStringW(L"close bgm", NULL, 0, NULL);      // 会顺带发一条 MCI_NOTIFY_ABORTED，不是"放完了"
+    bgmPlay = false;
+    bgmPause = false;
+}
+void BgmPause()
+{
+    if (!bgmPlay || bgmPause) return;
+    if (mciSendStringW(L"pause bgm", NULL, 0, NULL) == 0) { bgmPause = true; plyPauseAt = NowMs(); }
+}
+void BgmResume()
+{
+    if (!bgmPlay || !bgmPause) return;
+    if (mciSendStringW(L"resume bgm", NULL, 0, NULL) == 0) { bgmPause = false; plyPauseAt = 0; }
+}
+void BgmToggle() { if (bgmPause) BgmResume(); else BgmPause(); }
+
+void BgmPlay()
+{
+    if (!bgmOn) return;
+    if (!bgmPath[0]) HomeResolvePath();
+    if (!bgmPath[0]) return;
+    BgmStop();
+    wchar_t cmd[MAX_PATH + 64];
+    swprintf_s(cmd, L"open \"%ls\" type mpegvideo alias bgm", bgmPath);
+    if (mciSendStringW(cmd, NULL, 0, NULL) != 0) return;
+    int v = bgmV * 10; if (v < 0) v = 0; if (v > 1000) v = 1000;
+    swprintf_s(cmd, L"setaudio bgm volume to %d", v);
+    mciSendStringW(cmd, NULL, 0, NULL);
+    bgmPlay = true;
+    bgmPause = false;
+    // 带 notify：曲子自然放完时系统会给主窗口发 MM_MCINOTIFY，我们据此自动收掉播放器岛。
+    // 不这么做就只能轮询 status，而 MCI 的状态查询在某些驱动上会同步阻塞 UI 线程。
+    mciSendStringW(L"play bgm from 0 notify", NULL, 0, o);
+}
+
 void AudioPlay(AlarmType type)
 {
     if (!fuck) return;
@@ -1515,6 +2107,11 @@ void LoadAudioCfg()
         if (RegQueryValueEx(hKey, L"AudioVolStart", NULL, NULL, (LPBYTE)&v, &sz) == ERROR_SUCCESS) ab = (int)v;
         v = (DWORD)FUCK; sz = sizeof(v);
         if (RegQueryValueEx(hKey, L"AudioVolEnd", NULL, NULL, (LPBYTE)&v, &sz) == ERROR_SUCCESS) FUCK = (int)v;
+        v = 1; sz = sizeof(v);
+        if (RegQueryValueEx(hKey, L"HomeOn", NULL, NULL, (LPBYTE)&v, &sz) == ERROR_SUCCESS) bgmOn = (v != 0);
+        v = 15; sz = sizeof(v);
+        if (RegQueryValueEx(hKey, L"HomeVol", NULL, NULL, (LPBYTE)&v, &sz) == ERROR_SUCCESS) bgmV = (int)v;
+        if (bgmV < 0) bgmV = 0; if (bgmV > 100) bgmV = 100;
         if (ab < 0) ab = 0; if (ab > 100) ab = 100;
         if (FUCK < 0) FUCK = 0; if (FUCK > 100) FUCK = 100;
         RegCloseKey(hKey);
@@ -1532,206 +2129,12 @@ void SaveAudioCfg()
         RegSetValueEx(hKey, L"AudioVolStart", 0, REG_DWORD, (LPBYTE)&v, sizeof(v));
         v = (DWORD)FUCK;
         RegSetValueEx(hKey, L"AudioVolEnd", 0, REG_DWORD, (LPBYTE)&v, sizeof(v));
+        v = bgmOn ? 1 : 0;
+        RegSetValueEx(hKey, L"HomeOn", 0, REG_DWORD, (LPBYTE)&v, sizeof(v));
+        v = (DWORD)bgmV;
+        RegSetValueEx(hKey, L"HomeVol", 0, REG_DWORD, (LPBYTE)&v, sizeof(v));
         RegCloseKey(hKey);
     }
-}
-
-// ===== 音量调节面板（全自绘：圆角轨道 + 圆钮，跟随深浅主题）=====
-const int VSL_X0 = 24;      // 轨道左端
-const int VSL_X1 = 384;     // 轨道右端
-const int VSL_W  = 480;     // 客户区宽
-const int VSL_H  = 220;     // 客户区高
-int VolSliderY(int which) { return which == 0 ? 108 : 178; }
-RECT VolPreviewRect(int which)
-{
-    int y = VolSliderY(which);
-    RECT r = {VSL_X1 + 16, y - 15, VSL_X1 + 60, y + 15};
-    return r;
-}
-
-void VolDraw(HWND hWnd)
-{
-    PAINTSTRUCT ps;
-    HDC dc = BeginPaint(hWnd, &ps);
-    RECT rc; GetClientRect(hWnd, &rc);
-
-    int cBg    = z ? RGB(28,28,32)   : RGB(247,247,250);
-    int cTitle = z ? RGB(242,242,247): RGB(26,26,34);
-    int cLabel = z ? RGB(196,196,206): RGB(86,86,98);
-    int cTrack = z ? RGB(60,60,68)   : RGB(226,226,234);
-    int cFill  = z ? RGB(255,201,74) : RGB(226,166,40);
-    int cBtnB  = z ? RGB(48,48,56)   : RGB(238,238,244);
-    int cBtnT  = z ? RGB(230,230,238): RGB(40,40,50);
-
-    HBRUSH bg = CreateSolidBrush(cBg);
-    FillRect(dc, &rc, bg); DeleteObject(bg);
-    SetBkMode(dc, TRANSPARENT);
-
-    HFONT fTitle = GetCachedFont(20, true);
-    HFONT fLabel = GetCachedFont(14, false);
-    HFONT fValue = GetCachedFont(15, true);
-
-    SelectObject(dc, fTitle); SetTextColor(dc, cTitle);
-    TextOutW(dc, 24, 20, L"音量调节", 4);
-
-    for (int i = 0; i < 2; i++)
-    {
-        int vol = (i == 0) ? ab : FUCK;
-        int y   = VolSliderY(i);
-        const wchar_t* name = (i == 0) ? L"上课铃音量" : L"下课铃音量";
-
-        SelectObject(dc, fLabel); SetTextColor(dc, cLabel);
-        TextOutW(dc, VSL_X0, y - 42, name, (int)wcslen(name));
-
-        wchar_t vbuf[16]; swprintf_s(vbuf, L"%d%%", vol);
-        SelectObject(dc, fValue); SetTextColor(dc, cTitle);
-        SIZE vs; GetTextExtentPoint32W(dc, vbuf, (int)wcslen(vbuf), &vs);
-        TextOutW(dc, VSL_X1 - vs.cx, y - 43, vbuf, (int)wcslen(vbuf));
-
-        // 轨道
-        HBRUSH tb = CreateSolidBrush(cTrack);
-        HBRUSH ob = (HBRUSH)SelectObject(dc, tb);
-        RoundRect(dc, VSL_X0, y-3, VSL_X1, y+3, 6, 6);
-        SelectObject(dc, ob); DeleteObject(tb);
-
-        // 已填充
-        int tx = VSL_X0 + (VSL_X1 - VSL_X0) * vol / 100;
-        if (tx > VSL_X0)
-        {
-            HBRUSH fb = CreateSolidBrush(cFill);
-            ob = (HBRUSH)SelectObject(dc, fb);
-            RoundRect(dc, VSL_X0, y-3, tx, y+3, 6, 6);
-            SelectObject(dc, ob); DeleteObject(fb);
-        }
-
-        // 圆钮
-        int r = 9;
-        HBRUSH nb = CreateSolidBrush(RGB(255,255,255));
-        HPEN   np = CreatePen(PS_SOLID, 1, z ? RGB(96,96,106) : RGB(198,198,208));
-        ob = (HBRUSH)SelectObject(dc, nb);
-        SelectObject(dc, np);
-        Ellipse(dc, tx-r, y-r, tx+r, y+r);
-        SelectObject(dc, ob); SelectObject(dc, np);
-        DeleteObject(nb); DeleteObject(np);
-
-        // 试听按钮
-        RECT br = VolPreviewRect(i);
-        HBRUSH bb = CreateSolidBrush(cBtnB);
-        ob = (HBRUSH)SelectObject(dc, bb);
-        RoundRect(dc, br.left, br.top, br.right, br.bottom, 12, 12);
-        SelectObject(dc, ob); DeleteObject(bb);
-        SelectObject(dc, fLabel); SetTextColor(dc, cBtnT);
-        SIZE bs; GetTextExtentPoint32W(dc, L"试听", 2, &bs);
-        TextOutW(dc, br.left + ((br.right-br.left)-bs.cx)/2,
-                     br.top  + ((br.bottom-br.top)-bs.cy)/2, L"试听", 2);
-    }
-
-    HFONT fNote = GetCachedFont(12, false);
-    SelectObject(dc, fNote); SetTextColor(dc, cLabel);
-    TextOutW(dc, 24, VSL_H - 28, L"拖动滑块调节；点「试听」按当前音量放一次", 21);
-    EndPaint(hWnd, &ps);
-}
-
-// 客户区坐标 → 命中哪个滑块 / 哪个试听按钮（返回 0=上课 1=下课 -1=没有）
-int VolHitSlider(POINT p)
-{
-    for (int i = 0; i < 2; i++)
-    {
-        int y = VolSliderY(i);
-        if (p.x >= VSL_X0 - 16 && p.x <= VSL_X1 + 16 && p.y >= y - 20 && p.y <= y + 20) return i;
-    }
-    return -1;
-}
-int VolHitPreview(POINT p)
-{
-    for (int i = 0; i < 2; i++)
-    {
-        RECT r = VolPreviewRect(i);
-        if (p.x >= r.left && p.x < r.right && p.y >= r.top && p.y < r.bottom) return i;
-    }
-    return -1;
-}
-void VolSetFromX(int which, int x)
-{
-    int v = (x - VSL_X0) * 100 / (VSL_X1 - VSL_X0);
-    if (v < 0) v = 0;
-    if (v > 100) v = 100;
-    if (which == 0) ab = v; else FUCK = v;
-    SaveAudioCfg();
-    InvalidateRect(qq, NULL, FALSE);
-}
-
-LRESULT CALLBACK VolProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
-{
-    switch (msg)
-    {
-    case WM_PAINT:      VolDraw(hWnd); return 0;
-    case WM_ERASEBKGND: return 1;
-    case WM_LBUTTONDOWN:
-    {
-        POINT p = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
-        int pv = VolHitPreview(p);
-        if (pv >= 0) { AudioPlayAsync(pv == 0 ? ALARM_TYPE_CLASS_START : ALARM_TYPE_CLASS_END); return 0; }
-        int sl = VolHitSlider(p);
-        if (sl >= 0)
-        {
-            aj = sl;
-            SetCapture(hWnd);
-            VolSetFromX(sl, p.x);
-        }
-        return 0;
-    }
-    case WM_MOUSEMOVE:
-        if (aj >= 0 && (GetKeyState(VK_LBUTTON) & 0x8000))
-        {
-            POINT p = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
-            VolSetFromX(aj, p.x);
-        }
-        return 0;
-    case WM_LBUTTONUP:
-        if (aj >= 0) { aj = -1; if (GetCapture() == hWnd) ReleaseCapture(); }
-        return 0;
-    case WM_CAPTURECHANGED:
-        aj = -1;
-        return 0;
-    case WM_CLOSE:
-        DestroyWindow(hWnd);
-        return 0;
-    case WM_DESTROY:
-        qq = NULL; aj = -1;
-        return 0;
-    }
-    return DefWindowProcW(hWnd, msg, wParam, lParam);
-}
-
-void ShowVolumeWindow(HWND owner)
-{
-    if (qq) { SetForegroundWindow(qq); return; }   // 已经开着就拉到前面
-    static bool reg = false;
-    if (!reg)
-    {
-        reg = true;
-        WNDCLASSW wc = {0};
-        wc.lpfnWndProc = VolProc;
-        wc.hInstance = GetModuleHandleW(NULL);
-        wc.lpszClassName = L"IslandVolWnd";
-        wc.hbrBackground = NULL;
-        wc.hCursor = LoadCursor(NULL, IDC_ARROW);
-        RegisterClassW(&wc);
-    }
-    AudioResolvePath();
-    RECT r = {0, 0, VSL_W, VSL_H};
-    AdjustWindowRect(&r, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, FALSE);
-    int w = r.right - r.left, h = r.bottom - r.top;
-    POINT pt; GetCursorPos(&pt);
-    qq = CreateWindowExW(WS_EX_TOOLWINDOW, L"IslandVolWnd", L"音量调节",
-                         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
-                         pt.x - w / 2, pt.y - h - 24, w, h,
-                         owner, NULL, GetModuleHandleW(NULL), NULL);
-    if (!qq) return;
-    ShowWindow(qq, SW_SHOW);
-    UpdateWindow(qq);
-    SetForegroundWindow(qq);
 }
 
 void LoadTheme()
@@ -1779,24 +2182,179 @@ void LoadPeriodEnabled()
         if (RegQueryValueEx(hKey, L"PeriodEnabled", NULL, NULL, (LPBYTE)&dwData, &dwSize) == ERROR_SUCCESS)
         {
             found = true;
-            for (int i = 0; i < PERIOD_COUNT; i++)
+            for (int i = 0; i < pc; i++)
                 SetPeriodEnabled(i, (dwData & (1 << i)) != 0);
         }
         RegCloseKey(hKey);
     }
     if (!found)
     {
-        DWORD defaultMask = (1 << 7) | (1 << 8) | (1 << 9) | (1 << 10);
-        for (int i = 0; i < PERIOD_COUNT; i++)
+        DWORD defaultMask = 0;
+        for (int i = pc - 4; i < pc; i++) if (i >= 0) defaultMask |= (1 << i);   // 最后 4 节
+        for (int i = 0; i < pc; i++)
             SetPeriodEnabled(i, (defaultMask & (1 << i)) != 0);
         SavePeriodEnabled();
+    }
+}
+
+// 大岛上的"事件标签"文案（画岛和量宽度都用它，避免两处写不一样）
+void AlarmLabel(AlarmType t, wchar_t* out)
+{
+    if (t == ALARM_TYPE_CLASS_START)      wcscpy_s(out, 32, L"上课了");
+    else if (t == ALARM_TYPE_CLASS_END)   wcscpy_s(out, 32, L"下课了");
+    else                                  wcscpy_s(out, 32, L"时间到！");
+}
+
+// 让大岛宽度贴合文字：量出标签与主文字里更宽的那个，再加上留白
+// （原来固定屏宽 50%，写"下课了"时两侧空一大片；现在字占多少岛就多宽，有上下限兜底）
+void FitBigWidth(const wchar_t* label, const wchar_t* big, const wchar_t* extra, int extraPx)
+{
+    int fsLarge = (int)(12 + ((int)(ISLAND_HEIGHT*0.62) - 12));
+    int fsSmall = (int)(8  + ((int)(ISLAND_HEIGHT*0.20) - 8 ));
+    if (fsLarge < 12) fsLarge = 12;
+    if (fsSmall < 8)  fsSmall = 8;
+    HDC dc = GetDC(NULL);
+    SIZE s1 = {0,0}, s2 = {0,0}, s3 = {0,0};
+    HGDIOBJ old = SelectObject(dc, GetCachedFont(fsLarge, true));
+    if (big && big[0])   GetTextExtentPoint32W(dc, big,   (int)wcslen(big),   &s1);
+    if (extra && extra[0]) GetTextExtentPoint32W(dc, extra, (int)wcslen(extra), &s3);
+    SelectObject(dc, GetCachedFont(fsSmall, false));
+    if (label && label[0]) GetTextExtentPoint32W(dc, label, (int)wcslen(label), &s2);
+    SelectObject(dc, old);
+    ReleaseDC(NULL, dc);
+    int need = s1.cx;
+    if (s3.cx > need) need = s3.cx;
+    if (s2.cx > need) need = s2.cx;
+    need += 120 + extraPx;                           // 左右各留 60 的呼吸空间（extraPx 给播放键等托底）
+    int lo = B * 22 / 100, hi = B * 92 / 100;        // 最短/最长（别太窄也别顶到屏幕边）
+    if (need < lo) need = lo;
+    if (need > hi) need = hi;
+    g = need;
+    ComputeCanvasSize();
+}
+
+// 播放器下面那行"长按关闭播放器"只显示一小会儿，之后自己淡掉（一直挂着太吵）
+LONGLONG plyHintUntil = 0;
+
+// 让大岛以"音乐播放器"样式出现并常驻。
+// 三种来路都要照顾到：
+//   ① 大岛正定格（J=3）→ 形状不动，内容换成播放器，并把定格时间顶到很久以后
+//   ② 小岛/迷你岛在显示（J=6/7/11/12）→ 直接放大变身成大岛
+//   ③ 什么都没显示（J=0）→ 照常从最小尺寸弹出
+//   ④ 节日两段式正在演（J=10）→ 先别抢，等它演完（见 AnimTick 里 J=10 的收尾）
+void ShowPlayerIsland()
+{
+    bool grow = (bigH != PLAYER_H || g != PLAYER_W);            // 现在的尺寸是不是"播放器尺寸"
+    ply = true;
+    plyA = 255.0f; plyMix = false;                              // 默认完全不透明；要走过渡再单独置
+    ww = 255; plyHintUntil = NowMs() + 8000;                    // 露一下"长按关闭播放器"
+    if (J == 10) return;                                        // 节日两段式优先级更高（它收尾时会再叫一次）
+    CoverLoad();                                                // 每次进场重读一次封面（用户可能刚放进来）
+    bigH = PLAYER_H;                                            // 播放器比普通大岛高
+    g = PLAYER_W;                                               // 也比普通大岛长
+    ComputeCanvasSize();
+
+    if (J == 1 || J == 9) { S = NowMs() + PLAYER_LONG; return; }// 正在弹出/变大，内容自己会变成播放器
+    if (J == 3 && !grow)                                        // 已经是大岛且尺寸已对 → 原地换内容
+    {
+        S = NowMs() + PLAYER_LONG;
+        UpdateIslandDisplay(o, 1.0f, 255);
+        return;
+    }
+    if (J == 0)                                                 // 什么都没显示 → 从最小尺寸弹出
+    {
+        F = ISLAND_MIN_WIDTH; G = ISLAND_MIN_HEIGHT; E = 0; D = (B - F) / 2;
+        vv0 = 0.0f; vt = 0.0f; vv = 0.0f;
+        sf0 = 0.0f; sf1 = 0.0f; sf = 0.0f;
+        O = 0; I = 0.0f; J = 1;
+        PrepareBackdropBeforeShow();
+        R = NowMs();
+        return;
+    }
+    // 其余情况（大岛定格里但尺寸还是普通大岛 / 小岛 / 迷你岛）→ 走放大变身，长成播放器那个长方形。
+    // 同时开"接场过渡"：前 40% 把「下课了」淡出去，后 65% 播放器再淡进来（见 AnimTick 的 J=9）。
+    ae = F; an = G; ao = E;                                     // 从当前尺寸接着长，接缝处不跳
+    sf0 = sf; sf1 = 0.0f; nt = false;
+    gw = g; gh = bigH; gy = ISLAND_FINAL_Y; gJ = 3;
+    vv0 = 0.0f; vt = 0.0f; oo = 0; J = 9;
+    plyMix = true; plyA = 0.0f; ta = 255;
+    R = NowMs();
+}
+
+// 收掉播放器：停音乐 + 收回大岛
+void ClosePlayer()
+{
+    BgmStop();
+    ply = false;
+    bgmPause = false;
+    if (J == 1 || J == 3) { P = 0; J = 4; R = NowMs(); }
+    else UpdateIslandDisplay(o, 1.0f, 255);
+}
+
+void PlayerTick()
+{
+    LONGLONG now = NowMs();
+    // 按了暂停后 5 秒还没继续播 → 自动把播放器收掉（用户要求）
+    if (ply && bgmPause && plyPauseAt && now - plyPauseAt >= PLAYER_PAUSE_CLOSE_MS)
+    {
+        ClosePlayer();
+        return;
+    }
+    if (now < plyHintUntil)
+    {
+        if (ww < 255) { ww = 255; UpdateIslandDisplay(o, 1.0f, 255); }
+        return;
+    }
+    if (ww > 0)
+    {
+        ww -= 26; if (ww < 0) ww = 0;
+        UpdateIslandDisplay(o, 1.0f, 255);
+    }
+}
+
+// 点在播放/暂停键上？是就切一下，并返回 true（顺便别让这一下还去当"长按"）
+bool PlayerButtonHit(POINT ptScreen)
+{
+    // 必须"确实画着播放器"才算数：放学那一下大岛是按普通高度弹的（bigH 还没换成播放器高度），
+    // 那时按钮根本没画，plyBtn 里是上一轮的残留坐标，认了就会莫名其妙把音乐暂停。
+    if (!ply || bigH != PLAYER_H || plyA < 128.0f) return false;
+    if (plyBtn.right <= plyBtn.left) return false;
+    if (ptScreen.x < plyBtn.left || ptScreen.x >= plyBtn.right ||
+        ptScreen.y < plyBtn.top  || ptScreen.y >= plyBtn.bottom) return false;
+    BgmToggle();
+    plyHintUntil = NowMs() + 4000;      // 点一下把提示再叫出来几秒
+    ww = 255;
+    UpdateIslandDisplay(o, 1.0f, 255);
+    return true;
+}
+
+void LoadTimeTable()
+{
+    HKEY hKey; DWORD v = 1, sz = sizeof(v);
+    if (RegOpenKeyEx(HKEY_CURRENT_USER, L"Software\\IslandAlarm", 0, KEY_READ, &hKey) == ERROR_SUCCESS)
+    {
+        if (RegQueryValueEx(hKey, L"TimeTable", NULL, NULL, (LPBYTE)&v, &sz) == ERROR_SUCCESS) tbl = (int)v;
+        RegCloseKey(hKey);
+    }
+    if (tbl < 0 || tbl > 2) tbl = 1;                       // 认不出就用"冬季"
+    pc = (tbl == 0) ? 11 : 9;
+    ff = (tbl == 0) ? ffA : (tbl == 1 ? ffB : ffC);
+}
+void SaveTimeTable()
+{
+    HKEY hKey;
+    if (RegCreateKeyEx(HKEY_CURRENT_USER, L"Software\\IslandAlarm", 0, NULL, 0, KEY_SET_VALUE, NULL, &hKey, NULL) == ERROR_SUCCESS)
+    {
+        DWORD v = (DWORD)tbl;
+        RegSetValueEx(hKey, L"TimeTable", 0, REG_DWORD, (LPBYTE)&v, sizeof(v));
+        RegCloseKey(hKey);
     }
 }
 
 void SavePeriodEnabled()
 {
     DWORD dwData = 0;
-    for (int i = 0; i < PERIOD_COUNT; i++)
+    for (int i = 0; i < pc; i++)
         if (PeriodEnabled(i)) dwData |= (1 << i);
     HKEY hKey;
     if (RegCreateKeyEx(HKEY_CURRENT_USER, L"Software\\IslandAlarm", 0, NULL, 0, KEY_SET_VALUE, NULL, &hKey, NULL) == ERROR_SUCCESS)
@@ -1814,7 +2372,7 @@ void CreateTrayIcon(HWND hWnd)
     nid.uID = 1;
     nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     nid.uCallbackMessage = WM_TRAYICON;
-    nid.hIcon = LoadIcon(NULL, IDI_APPLICATION);
+    nid.hIcon = AppIcon();
     wcscpy_s(nid.szTip, L"mobile 上下课提醒");
     Shell_NotifyIcon(NIM_ADD, &nid);
     if (nid.hIcon) DestroyIcon(nid.hIcon);
@@ -1858,273 +2416,138 @@ void ShowNextAlarmTime()
     }
 }
 
-// ===== 设置窗口：把原先托盘的二级菜单整个搬成图形界面 =====
-// 全自绘（跟音量面板同一套画法），控件都按触控留足尺寸；点一下立刻生效并存盘
-const int SET_W = 560;
-const int SET_H = 750;
-HWND stw = NULL;            // 设置窗口
-int  sadj = -1;             // 正在拖的设置滑块（0=上课铃 1=下课铃 -1=没在拖）
+// ===== 设置窗口：真·系统窗口（标准控件，会出现在任务栏里）=====
+HWND stw = NULL;                  // 设置窗口
+HWND sPeriod[11] = {0};           // 时段勾选框
+HWND sTbl[3] = {0};               // 作息表：0=初四夏季 1=冬季 2=初四冬季
+HWND sVol[3] = {0};               // 音量滑块：0=上课铃 1=下课铃 2=《回家》
+HWND sVolPct[3] = {0};            // 音量百分比
+HWND sBgmOn = NULL;               // 放学播放《回家》
+HWND sTheme[2] = {0};             // 主题：0=浅色 1=深色
+HWND sAudioOn = NULL, sHoliday = NULL, sMini = NULL;
+HFONT sFont = NULL;
+#define ID_SET_CLOSE 1090
+#define ID_SET_PREV0 1091
+#define ID_SET_PREV1 1092
+#define ID_SET_BGM_ON 1093
+#define ID_SET_PREV2 1094
 
-// 一条条的控件（按钮 / 勾选）：坐标显式写死，改位置一眼就能找到
-struct SetCtl { int id; int x1, y1, x2, y2; const wchar_t* text; };
-static const SetCtl g_set[] = {
-    { ID_TRAY_AUDIO_ON,     28, 336, 268, 368, L"播放提醒音" },
-    { ID_TRAY_THEME_LIGHT,  28, 480, 148, 512, L"浅色" },
-    { ID_TRAY_THEME_DARK,  154, 480, 274, 512, L"深色" },
-    { ID_TRAY_HOLIDAY,     330, 480, 530, 512, L"特殊节日提醒" },
-    { ID_MINI_SHOW,         28, 554, 288, 586, L"显示迷你岛（顶边时间）" },
-    { ID_TRAY_AUDIO_VOL,   330, 554, 530, 586, L"精细调节音量…" },
-    { ID_TRAY_TEST,         28, 624, 178, 658, L"立即测试" },
-    { ID_TRAY_NEXT,        190, 624, 340, 658, L"下次提醒时间" },
-    { ID_TRAY_STATUS,      352, 624, 502, 658, L"状态信息" },
-    { ID_TRAY_AUTOSTART,    28, 668, 178, 702, L"开机自启动" },
-    { ID_TRAY_UPDATENOTES, 190, 668, 340, 702, L"更新速递" },
-    { ID_TRAY_EXIT,        352, 668, 502, 702, L"退出程序" },
-};
-// 时段勾选区：2 列 × 6 行
-RECT SetPeriodRect(int i)
+static HFONT SetUiFont()
 {
-    int col = i % 2, row = i / 2;
-    int x = 28 + col * 262, y = 96 + row * 36;
-    RECT r = { x, y, x + 246, y + 30 };
-    return r;
-}
-int  SetSliderY(int i)      { return i == 0 ? 386 : 444; }
-RECT SetTrackRect(int i)    { RECT r = { 28, SetSliderY(i) - 4, 368, SetSliderY(i) + 4 }; return r; }
-RECT SetPreviewRect(int i)  { int y = SetSliderY(i); RECT r = { 386, y - 16, 448, y + 16 }; return r; }
-
-// 勾选状态（哪些控件是"开关"）
-bool SetChecked(int id)
-{
-    if (id == ID_TRAY_AUDIO_ON)    return fuck;
-    if (id == ID_TRAY_HOLIDAY)     return hon;
-    if (id == ID_TRAY_THEME_LIGHT) return !z;
-    if (id == ID_TRAY_THEME_DARK)  return z;
-    if (id == ID_MINI_SHOW)        return ns;
-    if (id >= ID_PERIOD_BASE)      return PeriodEnabled(id - ID_PERIOD_BASE);
-    return false;
+    if (sFont) return sFont;
+    NONCLIENTMETRICSW ncm;
+    ncm.cbSize = sizeof(ncm);
+    if (SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0))
+        sFont = CreateFontIndirectW(&ncm.lfMessageFont);
+    if (!sFont) sFont = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+    return sFont;
 }
 
-void SetSetSlider(int which, int x)
+static HWND SetCtl(const wchar_t* cls, const wchar_t* txt, DWORD style,
+                   int x, int y, int w, int h, int id)
 {
-    // 用和音量面板同一套变量：ab=上课铃、FUCK=下课铃
-    RECT t = SetTrackRect(which);
-    int v = (x - t.left) * 100 / (t.right - t.left);
-    if (v < 0) v = 0;
-    if (v > 100) v = 100;
-    if (which == 0) ab = v; else FUCK = v;
-    SaveAudioCfg();
-    InvalidateRect(stw, NULL, FALSE);
+    HWND c = CreateWindowExW(0, cls, txt, WS_CHILD | WS_VISIBLE | style,
+                             x, y, w, h, stw, (HMENU)(INT_PTR)id, GetModuleHandleW(NULL), NULL);
+    if (c && cls != L"msctls_trackbar32") SendMessageW(c, WM_SETFONT, (WPARAM)SetUiFont(), TRUE);
+    return c;
 }
 
-void SetDraw(HWND hWnd)
+// 把控件状态从程序里同步过来（打开时、以及每次改动之后都调一次）
+void SetSyncControls()
 {
-    PAINTSTRUCT ps; HDC dc = BeginPaint(hWnd, &ps);
-    RECT rc; GetClientRect(hWnd, &rc);
-
-    int cBg    = z ? RGB(28,28,32)   : RGB(247,247,250);
-    int cTitle = z ? RGB(242,242,247): RGB(26,26,34);
-    int cLabel = z ? RGB(176,176,188): RGB(104,104,118);
-    int cBox   = z ? RGB(58,58,68)   : RGB(224,224,232);
-    int cTrack = z ? RGB(60,60,68)   : RGB(226,226,234);
-    int cFill  = z ? RGB(255,201,74) : RGB(226,166,40);
-    int cBtnB  = z ? RGB(48,48,56)   : RGB(238,238,244);
-    int cBtnT  = z ? RGB(230,230,238): RGB(40,40,50);
-
-    HBRUSH bg = CreateSolidBrush(cBg);
-    FillRect(dc, &rc, bg); DeleteObject(bg);
-    SetBkMode(dc, TRANSPARENT);
-
-    HFONT fTitle = GetCachedFont(22, true);
-    HFONT fSec   = GetCachedFont(14, true);
-    HFONT fItem  = GetCachedFont(14, false);
-    HFONT fSmall = GetCachedFont(12, false);
-
-    SelectObject(dc, fTitle); SetTextColor(dc, cTitle);
-    TextOutW(dc, 28, 18, L"mobile 设置", (int)wcslen(L"mobile 设置"));
-    SelectObject(dc, fSmall); SetTextColor(dc, cLabel);
-    TextOutW(dc, 28, 50, L"改动立即生效，设置会自动保存", (int)wcslen(L"改动立即生效，设置会自动保存"));
-
-    // ---- 区块标题 ----
-    SelectObject(dc, fSec); SetTextColor(dc, cTitle);
-    TextOutW(dc, 28,  70, L"时间提醒（打钩＝响铃）", (int)wcslen(L"时间提醒（打钩＝响铃）"));
-    TextOutW(dc, 28, 312, L"提醒音", (int)wcslen(L"提醒音"));
-    TextOutW(dc, 28, 456, L"主题", (int)wcslen(L"主题"));
-    TextOutW(dc, 28, 530, L"迷你岛", (int)wcslen(L"迷你岛"));
-    TextOutW(dc, 28, 600, L"其他", (int)wcslen(L"其他"));
-
-    // ---- 时段勾选（11 个）----
-    for (int i = 0; i < PERIOD_COUNT; i++)
+    if (!stw) return;
+    for (int i = 0; i < 3; i++)
+        if (sTbl[i]) SendMessageW(sTbl[i], BM_SETCHECK, (tbl == i) ? BST_CHECKED : BST_UNCHECKED, 0);
+    for (int i = 0; i < 11; i++)
     {
-        RECT r = SetPeriodRect(i);
-        int by = r.top + 5;
-        HBRUSH bb = CreateSolidBrush(PeriodEnabled(i) ? cFill : cBox);
-        HBRUSH ob = (HBRUSH)SelectObject(dc, bb);
-        RoundRect(dc, r.left, by, r.left + 20, by + 20, 6, 6);
-        SelectObject(dc, ob); DeleteObject(bb);
-        if (PeriodEnabled(i))
+        if (!sPeriod[i]) continue;
+        if (i < pc)
         {
-            HPEN pk = CreatePen(PS_SOLID, 3, z ? RGB(28,28,32) : RGB(255,255,255));
-            HPEN op = (HPEN)SelectObject(dc, pk);
-            MoveToEx(dc, r.left + 5, by + 11, NULL);
-            LineTo(dc, r.left + 9, by + 15);
-            LineTo(dc, r.left + 16, by + 5);
-            SelectObject(dc, op); DeleteObject(pk);
+            ShowWindow(sPeriod[i], SW_SHOW);
+            SetWindowTextW(sPeriod[i], ff[i]);
+            SendMessageW(sPeriod[i], BM_SETCHECK, PeriodEnabled(i) ? BST_CHECKED : BST_UNCHECKED, 0);
         }
-        SelectObject(dc, fItem); SetTextColor(dc, cTitle);
-        TextOutW(dc, r.left + 28, r.top + 5, ff[i], (int)wcslen(ff[i]));
+        else ShowWindow(sPeriod[i], SW_HIDE);       // 换表后多出来的勾选框藏起来
     }
-
-    // ---- 两个滑块 + 试听 ----
-    for (int i = 0; i < 2; i++)
-    {
-        int vol = (i == 0) ? ab : FUCK, y = SetSliderY(i);
-        RECT t = SetTrackRect(i);
-        const wchar_t* nm = (i == 0) ? L"上课铃" : L"下课铃";
-        SelectObject(dc, fItem); SetTextColor(dc, cLabel);
-        TextOutW(dc, 28, y - 30, nm, (int)wcslen(nm));
-
-        wchar_t vb[16]; swprintf_s(vb, L"%d%%", vol);
-        SelectObject(dc, fItem); SetTextColor(dc, cTitle);
-        SIZE vs; GetTextExtentPoint32W(dc, vb, (int)wcslen(vb), &vs);
-        TextOutW(dc, 455 - vs.cx, y - 30, vb, (int)wcslen(vb));
-
-        HBRUSH tb = CreateSolidBrush(cTrack);
-        HBRUSH ob = (HBRUSH)SelectObject(dc, tb);
-        RoundRect(dc, t.left, t.top, t.right, t.bottom, 8, 8);
-        SelectObject(dc, ob); DeleteObject(tb);
-        int tx = t.left + (t.right - t.left) * vol / 100;
-        if (tx > t.left)
-        {
-            HBRUSH fb = CreateSolidBrush(cFill);
-            ob = (HBRUSH)SelectObject(dc, fb);
-            RoundRect(dc, t.left, t.top, tx, t.bottom, 8, 8);
-            SelectObject(dc, ob); DeleteObject(fb);
-        }
-        HBRUSH nb = CreateSolidBrush(RGB(255,255,255));
-        HPEN   np = CreatePen(PS_SOLID, 1, z ? RGB(96,96,106) : RGB(198,198,208));
-        ob = (HBRUSH)SelectObject(dc, nb); SelectObject(dc, np);
-        Ellipse(dc, tx - 10, y - 10, tx + 10, y + 10);
-        SelectObject(dc, ob); SelectObject(dc, np);
-        DeleteObject(nb); DeleteObject(np);
-
-        RECT pr = SetPreviewRect(i);
-        HBRUSH pb = CreateSolidBrush(cBtnB);
-        ob = (HBRUSH)SelectObject(dc, pb);
-        RoundRect(dc, pr.left, pr.top, pr.right, pr.bottom, 14, 14);
-        SelectObject(dc, ob); DeleteObject(pb);
-        SelectObject(dc, fItem); SetTextColor(dc, cBtnT);
-        SIZE bs; GetTextExtentPoint32W(dc, L"试听", 2, &bs);
-        TextOutW(dc, pr.left + ((pr.right - pr.left) - bs.cx) / 2,
-                     pr.top + ((pr.bottom - pr.top) - bs.cy) / 2, L"试听", 2);
-    }
-
-    // ---- 按钮 / 勾选 ----
-    for (const auto& c : g_set)
-    {
-        bool isChk = (c.id == ID_TRAY_AUDIO_ON || c.id == ID_TRAY_HOLIDAY ||
-                      c.id == ID_TRAY_THEME_LIGHT || c.id == ID_TRAY_THEME_DARK || c.id == ID_MINI_SHOW);
-        if (isChk)
-        {
-            bool on = SetChecked(c.id);
-            HBRUSH bb = CreateSolidBrush(on ? cFill : cBox);
-            HBRUSH ob = (HBRUSH)SelectObject(dc, bb);
-            RoundRect(dc, c.x1, c.y1, c.x1 + 22, c.y1 + 22, 6, 6);
-            SelectObject(dc, ob); DeleteObject(bb);
-            if (on)
-            {
-                HPEN pk = CreatePen(PS_SOLID, 3, z ? RGB(28,28,32) : RGB(255,255,255));
-                HPEN op = (HPEN)SelectObject(dc, pk);
-                MoveToEx(dc, c.x1 + 5, c.y1 + 12, NULL);
-                LineTo(dc, c.x1 + 9, c.y1 + 16);
-                LineTo(dc, c.x1 + 17, c.y1 + 6);
-                SelectObject(dc, op); DeleteObject(pk);
-            }
-            SelectObject(dc, fItem); SetTextColor(dc, cTitle);
-            TextOutW(dc, c.x1 + 30, c.y1 + 2, c.text, (int)wcslen(c.text));
-        }
-        else
-        {
-            HBRUSH bb = CreateSolidBrush(cBtnB);
-            HBRUSH ob = (HBRUSH)SelectObject(dc, bb);
-            RoundRect(dc, c.x1, c.y1, c.x2, c.y2, 12, 12);
-            SelectObject(dc, ob); DeleteObject(bb);
-            SelectObject(dc, fItem); SetTextColor(dc, cBtnT);
-            SIZE bs; GetTextExtentPoint32W(dc, c.text, (int)wcslen(c.text), &bs);
-            TextOutW(dc, c.x1 + ((c.x2 - c.x1) - bs.cx) / 2,
-                         c.y1 + ((c.y2 - c.y1) - bs.cy) / 2, c.text, (int)wcslen(c.text));
-        }
-    }
-    EndPaint(hWnd, &ps);
-}
-
-// 点在哪：>=1000 时段、>=9900 试听、>=9910 滑块、其余就是控件 id
-int SetHit(POINT p)
-{
-    for (int i = 0; i < PERIOD_COUNT; i++)
-    {
-        RECT r = SetPeriodRect(i);
-        if (PtInRect(&r, p)) return ID_PERIOD_BASE + i;
-    }
-    for (const auto& c : g_set)
-    {
-        RECT r = { c.x1, c.y1, c.x2, c.y2 };
-        if (PtInRect(&r, p)) return c.id;
-    }
-    for (int i = 0; i < 2; i++)
-    {
-        RECT r = SetPreviewRect(i);
-        if (PtInRect(&r, p)) return 9900 + i;
-    }
-    for (int i = 0; i < 2; i++)
-    {
-        RECT t = SetTrackRect(i);
-        RECT r = { t.left - 14, t.top - 14, t.right + 14, t.bottom + 14 };
-        if (PtInRect(&r, p)) return 9910 + i;
-    }
-    return -1;
+    if (sAudioOn)  SendMessageW(sAudioOn,  BM_SETCHECK, fuck ? BST_CHECKED : BST_UNCHECKED, 0);
+    if (sHoliday)  SendMessageW(sHoliday,  BM_SETCHECK, hon  ? BST_CHECKED : BST_UNCHECKED, 0);
+    if (sMini)     SendMessageW(sMini,     BM_SETCHECK, ns   ? BST_CHECKED : BST_UNCHECKED, 0);
+    if (sTheme[0]) SendMessageW(sTheme[0], BM_SETCHECK, !z   ? BST_CHECKED : BST_UNCHECKED, 0);
+    if (sTheme[1]) SendMessageW(sTheme[1], BM_SETCHECK,  z   ? BST_CHECKED : BST_UNCHECKED, 0);
+    wchar_t b[16];
+    if (sVol[0])    SendMessageW(sVol[0], TBM_SETPOS, TRUE, ab);
+    if (sVol[1])    SendMessageW(sVol[1], TBM_SETPOS, TRUE, FUCK);
+    if (sVol[2])    SendMessageW(sVol[2], TBM_SETPOS, TRUE, bgmV);
+    if (sVolPct[0]) { swprintf_s(b, L"%d%%", ab);   SetWindowTextW(sVolPct[0], b); }
+    if (sVolPct[1]) { swprintf_s(b, L"%d%%", FUCK); SetWindowTextW(sVolPct[1], b); }
+    if (sVolPct[2]) { swprintf_s(b, L"%d%%", bgmV); SetWindowTextW(sVolPct[2], b); }
+    if (sBgmOn)     SendMessageW(sBgmOn, BM_SETCHECK, bgmOn ? BST_CHECKED : BST_UNCHECKED, 0);
 }
 
 LRESULT CALLBACK SetProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
     switch (msg)
     {
-    case WM_PAINT:      SetDraw(hWnd); return 0;
-    case WM_ERASEBKGND: return 1;
-    case WM_LBUTTONDOWN:
+    case WM_COMMAND:
     {
-        POINT p = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
-        int id = SetHit(p);
-        if (id >= 9910)      { sadj = id - 9910; SetCapture(hWnd); SetSetSlider(sadj, p.x); }
-        else if (id >= 9900)   AudioPlayAsync(id == 9900 ? ALARM_TYPE_CLASS_START : ALARM_TYPE_CLASS_END);
-        else if (id >= 0)
+        int id = LOWORD(wParam);
+        if (id == ID_SET_CLOSE) { DestroyWindow(hWnd); return 0; }
+        if (id == ID_SET_PREV0) { AudioPlayAsync(ALARM_TYPE_CLASS_START); return 0; }
+        if (id == ID_SET_PREV1) { AudioPlayAsync(ALARM_TYPE_CLASS_END);   return 0; }
+        if (id == ID_SET_PREV2) { BgmPlay(); if (bgmPlay) ShowPlayerIsland(); return 0; }   // 试听顺便预览播放器样式
+        if (id == ID_SET_BGM_ON)
         {
-            int send = id;
-            // "显示迷你岛"这一条是开关：按当前状态决定发"展开"还是"收起"
-            if (id == ID_MINI_SHOW) send = ns ? ID_MINI_HIDE : ID_MINI_SHOW;
-            SendMessage(o, WM_COMMAND, (WPARAM)send, 0);     // 复用主窗口那套处理，不重写逻辑
-            InvalidateRect(hWnd, NULL, FALSE);
+            bgmOn = !bgmOn;
+            if (!bgmOn) BgmStop();
+            SaveAudioCfg(); SetSyncControls();
+            return 0;
+        }
+        if (id >= ID_PERIOD_BASE && id < ID_PERIOD_BASE + 11)
+        {
+            SendMessageW(o, WM_COMMAND, (WPARAM)id, 0);     // 复用主窗口那套（勾选 + 存盘）
+            SetSyncControls();
+            return 0;
+        }
+        switch (id)
+        {
+        case ID_TBL_OLD: case ID_TBL_WINTER: case ID_TBL_W4:
+        case ID_TRAY_AUDIO_ON: case ID_TRAY_HOLIDAY:
+        case ID_TRAY_THEME_LIGHT: case ID_TRAY_THEME_DARK:
+        case ID_MINI_SHOW: case ID_MINI_HIDE:
+        case ID_TRAY_AUTOSTART: case ID_TRAY_TEST:
+        case ID_TRAY_NEXT: case ID_TRAY_STATUS:
+            {
+                int send = id;
+                if (id == ID_MINI_SHOW) send = ns ? ID_MINI_HIDE : ID_MINI_SHOW;   // 勾选框来回切
+                SendMessageW(o, WM_COMMAND, (WPARAM)send, 0);
+                SetSyncControls();
+                return 0;
+            }
+        }
+        break;
+    }
+    case WM_HSCROLL:
+    {
+        HWND c = (HWND)lParam;
+        if (c == sVol[0] || c == sVol[1] || c == sVol[2])
+        {
+            int v = (int)SendMessageW(c, TBM_GETPOS, 0, 0);
+            if (v < 0) v = 0;
+            if (v > 100) v = 100;
+            if (c == sVol[0]) ab = v; else if (c == sVol[1]) FUCK = v; else bgmV = v;
+            SaveAudioCfg();
+            SetSyncControls();
         }
         return 0;
     }
-    case WM_MOUSEMOVE:
-        if (sadj >= 0 && (GetKeyState(VK_LBUTTON) & 0x8000))
-        {
-            POINT p = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
-            SetSetSlider(sadj, p.x);
-        }
-        return 0;
-    case WM_LBUTTONUP:
-        if (sadj >= 0) { sadj = -1; if (GetCapture() == hWnd) ReleaseCapture(); }
-        return 0;
-    case WM_CAPTURECHANGED:
-        sadj = -1;
-        return 0;
+    case WM_CTLCOLORSTATIC:
+        SetBkMode((HDC)wParam, TRANSPARENT);
+        return (LRESULT)GetSysColorBrush(COLOR_BTNFACE);
     case WM_CLOSE:
         DestroyWindow(hWnd);
         return 0;
     case WM_DESTROY:
-        stw = NULL; sadj = -1;
+        stw = NULL;
         return 0;
     }
     return DefWindowProcW(hWnd, msg, wParam, lParam);
@@ -2132,7 +2555,8 @@ LRESULT CALLBACK SetProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
 
 void ShowSettingsWindow(HWND owner)
 {
-    if (stw) { SetForegroundWindow(stw); return; }     // 已经开着就拉到前面
+    (void)owner;
+    if (stw) { ShowWindow(stw, SW_RESTORE); SetForegroundWindow(stw); return; }
     static bool reg = false;
     if (!reg)
     {
@@ -2141,18 +2565,79 @@ void ShowSettingsWindow(HWND owner)
         wc.lpfnWndProc = SetProc;
         wc.hInstance = GetModuleHandleW(NULL);
         wc.lpszClassName = L"MobileSetWnd";
-        wc.hbrBackground = NULL;
+        wc.hbrBackground = GetSysColorBrush(COLOR_BTNFACE);
         wc.hCursor = LoadCursor(NULL, IDC_ARROW);
-        RegisterClassW(&wc);
+        wc.hIcon = AppIcon();
+                RegisterClassW(&wc);
     }
-    RECT r = {0, 0, SET_W, SET_H};
-    AdjustWindowRect(&r, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, FALSE);
+    const int CW = 560, CH = 776;
+    RECT r = {0, 0, CW, CH};
+    DWORD st = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
+    AdjustWindowRect(&r, st, FALSE);
     int w = r.right - r.left, h = r.bottom - r.top;
     int x = (GetSystemMetrics(SM_CXSCREEN) - w) / 2;
-    stw = CreateWindowExW(WS_EX_TOOLWINDOW, L"MobileSetWnd", L"mobile 设置",
-                          WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
-                          x, 60, w, h, owner, NULL, GetModuleHandleW(NULL), NULL);
+    int y = (GetSystemMetrics(SM_CYSCREEN) - h) / 2 - 30;
+    // 关键：不加 WS_EX_TOOLWINDOW、也不给 owner → 它会像正常程序一样出现在任务栏
+    stw = CreateWindowExW(0, L"MobileSetWnd", L"mobile 设置", st,
+                          x, y, w, h, NULL, NULL, GetModuleHandleW(NULL), NULL);
     if (!stw) return;
+
+    // ---- 作息表 ----
+    SetCtl(L"BUTTON", L"作息表", BS_GROUPBOX, 12, 8, 536, 76, -1);
+    sTbl[0] = SetCtl(L"BUTTON", L"初四夏季作息", BS_AUTORADIOBUTTON | WS_GROUP, 28, 34, 150, 24, ID_TBL_OLD);
+    sTbl[1] = SetCtl(L"BUTTON", L"冬季作息",     BS_AUTORADIOBUTTON,            190, 34, 140, 24, ID_TBL_WINTER);
+    sTbl[2] = SetCtl(L"BUTTON", L"初四冬季作息", BS_AUTORADIOBUTTON,            344, 34, 160, 24, ID_TBL_W4);
+
+    // ---- 时间提醒（建满 11 个，按当前作息表显示/隐藏）----
+    SetCtl(L"BUTTON", L"时间提醒（打钩＝到点响铃）", BS_GROUPBOX, 12, 92, 536, 186, -1);
+    for (int i = 0; i < 11; i++)
+    {
+        int col = i % 2, row = i / 2;
+        sPeriod[i] = SetCtl(L"BUTTON", L"", BS_AUTOCHECKBOX,
+                            28 + col * 258, 116 + row * 26, 250, 24, ID_PERIOD_BASE + i);
+    }
+
+    // ---- 提醒音 ----
+    SetCtl(L"BUTTON", L"提醒音 / 放学音乐", BS_GROUPBOX, 12, 286, 536, 192, -1);
+    sAudioOn = SetCtl(L"BUTTON", L"播放提醒音", BS_AUTOCHECKBOX, 28, 310, 220, 24, ID_TRAY_AUDIO_ON);
+    SetCtl(L"STATIC", L"上课铃", SS_LEFT, 28, 346, 84, 20, -1);
+    sVol[0]    = SetCtl(L"msctls_trackbar32", L"", TBS_HORZ | TBS_NOTICKS, 118, 338, 268, 30, -1);
+    sVolPct[0] = SetCtl(L"STATIC", L"0%", SS_LEFT, 394, 346, 52, 20, -1);
+    SetCtl(L"BUTTON", L"试听", BS_PUSHBUTTON, 452, 339, 62, 28, ID_SET_PREV0);
+    SetCtl(L"STATIC", L"下课铃", SS_LEFT, 28, 380, 84, 20, -1);
+    sVol[1]    = SetCtl(L"msctls_trackbar32", L"", TBS_HORZ | TBS_NOTICKS, 118, 372, 268, 30, -1);
+    sVolPct[1] = SetCtl(L"STATIC", L"0%", SS_LEFT, 394, 380, 52, 20, -1);
+    SetCtl(L"BUTTON", L"试听", BS_PUSHBUTTON, 452, 373, 62, 28, ID_SET_PREV1);
+    sBgmOn = SetCtl(L"BUTTON", L"放学播放《回家》（同目录 Home.mp3）", BS_AUTOCHECKBOX, 28, 412, 320, 24, ID_SET_BGM_ON);
+    SetCtl(L"STATIC", L"《回家》音量", SS_LEFT, 28, 448, 84, 20, -1);
+    sVol[2]    = SetCtl(L"msctls_trackbar32", L"", TBS_HORZ | TBS_NOTICKS, 118, 440, 268, 30, -1);
+    sVolPct[2] = SetCtl(L"STATIC", L"0%", SS_LEFT, 394, 448, 52, 20, -1);
+    SetCtl(L"BUTTON", L"试听", BS_PUSHBUTTON, 452, 441, 62, 28, ID_SET_PREV2);
+
+    // ---- 主题 ----
+    SetCtl(L"BUTTON", L"主题", BS_GROUPBOX, 12, 486, 536, 70, -1);
+    sTheme[0] = SetCtl(L"BUTTON", L"浅色", BS_AUTORADIOBUTTON | WS_GROUP, 28, 508, 90, 24, ID_TRAY_THEME_LIGHT);
+    sTheme[1] = SetCtl(L"BUTTON", L"深色", BS_AUTORADIOBUTTON,            124, 508, 90, 24, ID_TRAY_THEME_DARK);
+    sHoliday  = SetCtl(L"BUTTON", L"特殊节日提醒", BS_AUTOCHECKBOX,       300, 508, 230, 24, ID_TRAY_HOLIDAY);
+
+    // ---- 迷你岛 ----
+    SetCtl(L"BUTTON", L"迷你岛", BS_GROUPBOX, 12, 564, 536, 56, -1);
+    sMini = SetCtl(L"BUTTON", L"显示迷你岛（顶边时间）", BS_AUTOCHECKBOX, 28, 586, 300, 24, ID_MINI_SHOW);
+
+    // ---- 其他 ----
+    SetCtl(L"BUTTON", L"其他", BS_GROUPBOX, 12, 628, 536, 76, -1);
+    SetCtl(L"BUTTON", L"立即测试",      BS_PUSHBUTTON, 28,  650, 160, 28, ID_TRAY_TEST);
+    SetCtl(L"BUTTON", L"下次提醒时间",  BS_PUSHBUTTON, 196, 650, 160, 28, ID_TRAY_NEXT);
+    SetCtl(L"BUTTON", L"状态信息",      BS_PUSHBUTTON, 364, 650, 160, 28, ID_TRAY_STATUS);
+    SetCtl(L"BUTTON", L"开机自启动",    BS_PUSHBUTTON, 28,  680, 160, 28, ID_TRAY_AUTOSTART);
+    SetCtl(L"BUTTON", L"退出程序",      BS_PUSHBUTTON, 364, 680, 160, 28, ID_TRAY_EXIT);
+    SetCtl(L"BUTTON", L"关闭",          BS_PUSHBUTTON, 436, 724, 100, 30, ID_SET_CLOSE);
+
+    // 滑块的量程
+    for (int i = 0; i < 3; i++)
+        if (sVol[i]) SendMessageW(sVol[i], TBM_SETRANGE, TRUE, MAKELPARAM(0, 100));
+
+    SetSyncControls();
     ShowWindow(stw, SW_SHOW);
     UpdateWindow(stw);
     SetForegroundWindow(stw);
@@ -2171,17 +2656,117 @@ void ShowTrayMenu(HWND hWnd)
     DestroyMenu(hMenu);
 }
 
-void ShowMessageIsland(const wchar_t* text)
+void ShowMessageIsland(const wchar_t* text, int extraW)
 {
     KillTimer(o,1); KillTimer(o,2); KillTimer(o,3); KillTimer(o,4);
-    O=0; P=0;
     hh = true;
     wcscpy_s(gg, text);
     vv = 0.0f; af = false; ww = 0;
-    L=true; J=1;
+    if (extraW <= 0) privKind = 0;         // 普通消息：把左边的图标位让出来
+    // ⚠️ 大岛永远是"普通圆角"。sf 是迷你岛的吸顶形状因子（1=上两角收成直角），
+    // 迷你岛状态退出后会留着 1 —— 不清掉的话，紧接着弹出来的大岛**上两角是直角**，
+    // 看着就是"上半截和迷你岛一样，没有圆角"。
+    sf = 0.0f; sf0 = 0.0f; sf1 = 0.0f;
+    // extraW：左边要放图标时多留出来的宽度（隐私提示用），普通消息传 0
+    FitBigWidth(NULL, gg, NULL, extraW);
+    L = true;
+    // 大岛已经挂在屏幕上了（典型场景：连着点「开机自启动」）→ 只把字换掉，
+    // 别再从头弹跳一遍 —— 用户明确要求"直接变字体就行了"。
+    if (J == 1 || J == 3)
+    {
+        if (J == 3) { F = g; D = (B - F) / 2; E = ISLAND_FINAL_Y; }
+        S = NowMs() + DISPLAY_DURATION_MS;      // 换字之后重新计 5 秒
+        UpdateIslandDisplay(o, 1.0f, 255);
+        return;
+    }
+    O=0; P=0;
+    J=1;
 
     PrepareBackdropBeforeShow();
     R = NowMs(); // 交主循环 60fps 调度
+}
+
+// ===== 麦克风 / 摄像头被占用 → 弹岛提示（2026-10-13 加）=====
+// 数据源是 Windows 自己那份"隐私设备使用记录"（就是系统托盘里"摄像头正在使用"
+// 那个小图标的同一份数据）：
+//   HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore
+//        \<microphone|webcam>\<NonPackaged|Packaged>\<应用>
+//            LastUsedTimeStart / LastUsedTimeStop   （FILETIME）
+// 判据：start != 0 且 stop == 0 → 正在占用。
+// ⚠️ 这个键是系统管的，**只读，绝不往里写**。
+static ULONGLONG ReadTimeVal(HKEY k, const wchar_t* name)
+{
+    BYTE buf[16] = {0};
+    DWORD sz = sizeof(buf), type = 0;
+    if (RegQueryValueExW(k, name, NULL, &type, buf, &sz) != ERROR_SUCCESS) return 0;
+    if (type == REG_BINARY && sz >= 8) { ULONGLONG v = 0; memcpy(&v, buf, 8); return v; }
+    if (type == REG_DWORD  && sz >= 4) { DWORD v = 0;    memcpy(&v, buf, 4); return v; }
+    return 0;
+}
+
+bool PrivacyDeviceInUse(const wchar_t* dev)
+{
+    const wchar_t* CATS[2] = { L"NonPackaged", L"Packaged" };
+    FILETIME ftNow; GetSystemTimeAsFileTime(&ftNow);
+    ULONGLONG now = 0; memcpy(&now, &ftNow, 8);
+    const ULONGLONG FRESH = 12ULL * 3600ULL * 10000000ULL;      // 只认 12 小时内的起点
+    for (int c = 0; c < 2; c++)
+    {
+        wchar_t path[512];
+        swprintf_s(path, L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\CapabilityAccessManager"
+                         L"\\ConsentStore\\%ls\\%ls", dev, CATS[c]);
+        HKEY hk;
+        if (RegOpenKeyExW(HKEY_CURRENT_USER, path, 0, KEY_READ, &hk) != ERROR_SUCCESS) continue;
+        DWORD sub = 0;
+        RegQueryInfoKeyW(hk, NULL, NULL, NULL, &sub, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+        bool hit = false;
+        for (DWORD i = 0; i < sub && !hit; i++)
+        {
+            wchar_t name[512]; DWORD cch = 512;
+            if (RegEnumKeyExW(hk, i, name, &cch, NULL, NULL, NULL, NULL) != ERROR_SUCCESS) continue;
+            HKEY sk;
+            if (RegOpenKeyExW(hk, name, 0, KEY_READ, &sk) != ERROR_SUCCESS) continue;
+            ULONGLONG st = ReadTimeVal(sk, L"LastUsedTimeStart");
+            ULONGLONG sp = ReadTimeVal(sk, L"LastUsedTimeStop");
+            RegCloseKey(sk);
+            // start 非 0 且 stop 是 0 → 正在用。
+            // 再加一条"起点得够近"：程序崩掉会把 stop 永远留在 0，
+            // 这种历史残留不该开机就报警。
+            if (st != 0 && sp == 0 && st <= now && now - st <= FRESH) hit = true;
+        }
+        RegCloseKey(hk);
+        if (hit) return true;
+    }
+    return false;
+}
+
+// 弹出这条提示。privKind 必须先设好 —— ShowMessageIsland 按它决定左边要多留多宽。
+void ShowPrivacyIsland(int kind)
+{
+    privKind = kind;
+    const wchar_t* txt = (kind == 3) ? L"麦克风、摄像头被使用中"
+                       : (kind == 2) ? L"摄像头被使用中"
+                                     : L"麦克风被使用中";
+    int extra = PRIV_PAD_L + PRIV_ICON_W + PRIV_GAP;
+    if (kind == 3) extra += PRIV_ICON_W + 10;         // 两个图标并排，再多留一个
+    ShowMessageIsland(txt, extra);
+}
+
+// 每秒看一眼：谁"从不使用变成正在使用"就弹一次；岛正忙就先挂起来，等空出来再弹。
+void PrivacyTick()
+{
+    static int  lastMic = 0, lastCam = 0;
+    static bool inited = false;
+    int mic = PrivacyDeviceInUse(L"microphone") ? 1 : 0;
+    int cam = PrivacyDeviceInUse(L"webcam")     ? 1 : 0;
+    if (!inited) { inited = true; lastMic = mic; lastCam = cam; return; }   // 开机第一次只记状态
+    int want = (mic && cam) ? 3 : (mic ? 1 : (cam ? 2 : 0));
+    bool changed = (mic != lastMic) || (cam != lastCam);
+    lastMic = mic; lastCam = cam;
+    if (!want) return;                              // 都松开了：岛上那条自己会收回，不用管
+    if (!changed && want == privKind) return;       // 没变化也没换设备 → 别重复弹
+    if (J == 0 || J == 3 || J == 11 || J == 12) { privWait = false; ShowPrivacyIsland(want); }
+    else { privWait = true; privWant = want; }      // 大岛/变身正忙 → 挂起来
 }
 
 // ===== 节日彩蛋弹窗：只挂在"今天最后一节课下课"（放学）那一刻 =====
@@ -2189,7 +2774,7 @@ void ShowMessageIsland(const wchar_t* text)
 // 判断"这节课是不是最后一场下课"：今天所有打钩的时段里，再没有比它更晚的下课了。
 bool IsLastClassEndOfDay(int curMin)
 {
-    for (int i = 0; i < PERIOD_COUNT; i++)
+    for (int i = 0; i < pc; i++)
     {
         if (!PeriodEnabled(i)) continue;                 // 没打钩的时段不算
         int h = 0, m = 0;
@@ -2234,7 +2819,7 @@ void LoadNotchCfg()
     HKEY hKey;
     if (RegOpenKeyEx(HKEY_CURRENT_USER, L"Software\\IslandAlarm", 0, KEY_READ, &hKey) == ERROR_SUCCESS)
     {
-        DWORD v = 1, sz = sizeof(v);
+        DWORD v = 1, sz = sizeof(v);      // 默认 1 = 冬季作息
         if (RegQueryValueEx(hKey, L"NotchShow", NULL, NULL, (LPBYTE)&v, &sz) == ERROR_SUCCESS) ns = (v != 0);
         RegCloseKey(hKey);
     }
@@ -2269,18 +2854,19 @@ void ShowNotch()
     if (J == 11 || J == 12) return;
     if (J == 1 || J == 3 || J == 4 || J == 5 || J == 9 || J == 10) return;   // 大岛/变身优先，不抢
     pp = false;                                // 迷你岛只显示时间，绝不去显示倒计时
+    hh = false;                                // 同上：常驻岛不是消息，别把时间吞了
     if (J == 6 || J == 7)                      // 小岛（倒计时）正显示 → 直接变身成迷你岛，不先收再弹
     {
         nt = false; ae = F; an = G; ao = E;
-        gw = NOTCH_WIDTH; gh = NOTCH_HEIGHT; gy = 0; gJ = 12;
-        oo = 0; vv0 = 1.0f; vt = 1.0f;
+        gw = NOTCH_WIDTH; gh = NOTCH_HEIGHT; gy = NOTCH_Y; gJ = 12;
+        oo = 0; vv0 = 1.0f; vt = 1.0f; sf0 = sf; sf1 = 0.0f;   // 两端都是圆角，形状不用变
         J = 5;
         PrepareBackdropBeforeShow();
         R = NowMs();
         return;
     }
     nt = true; nv = 255; na = NowMs();
-    F = NOTCH_WIDTH; G = NOTCH_HEIGHT; E = 0; D = (B - F) / 2;
+    F = NOTCH_WIDTH; G = NOTCH_HEIGHT; E = NOTCH_Y; D = (B - F) / 2;
     O = 0; vv = 1.0f; ai = -1;
     J = 11;                                   // 从屏幕边缘上方"落"下来
     PrepareBackdropBeforeShow();
@@ -2293,9 +2879,9 @@ void HideNotch()
 // 迷你岛常驻期间的心跳：到秒就重绘（分钟跳变），静止够久就把整块降成半透明
 void NotchHoldTick()
 {
-    bool need = false;
+    hh = false;          // 兜底：迷你岛只显示时间
     int nowSec = (int)(NowMs() / 1000);
-    if (nowSec != ai) { ai = nowSec; need = true; }
+    if (nowSec != ai) ai = nowSec;
     int target = (NowMs() - na > NOTCH_DIM_MS) ? NOTCH_DIM_A : 255;
     if (nv != target)
     {
@@ -2303,9 +2889,21 @@ void NotchHoldTick()
         if (d > step) nv += step;
         else if (d < -step) nv -= step;
         else nv = target;
-        need = true;
     }
-    if (need) UpdateIslandDisplay(o, 1.0f, 255);
+    // ===== 自愈（2026-10-13 加）=====
+    // 迷你岛是这个程序的"常驻形态"，一挂就是几个小时。它是置顶分层窗口，时间长了有三种翻车法：
+    //   ① 后面又冒出别的置顶窗口（全屏视频、白板的置顶工具条、任务管理器"置于顶层"）把它压住；
+    //   ② 系统省电/切分辨率/远程桌面上来之后，窗口内容被丢掉；
+    //   ③ 窗口本身被谁 ShowWindow(SW_HIDE) 了。
+    // 原来只在"秒数变了"的时候重画，一旦被压住/丢掉就永远回不来 —— 用户报的"开着开着迷你岛没了"就是它。
+    // 现在每秒：确认还显示着 → 确认还在最上层（**只在真被盖住时才动手**）→ 重画一帧。
+    // ⚠️ 不能每秒无条件 SetWindowPos(HWND_TOPMOST)：那会一直把别的置顶窗口往下压，
+    //    实测会把同机的设置窗口都顶不下去（踩过）。只在被盖住时才重新顶。
+    if (!IsWindowVisible(o)) ShowWindow(o, SW_SHOWNOACTIVATE);
+    POINT c = { D + F / 2, E + G / 2 };              // 岛正中心（屏幕坐标）
+    if (WindowFromPoint(c) != o)
+        SetWindowPos(o, HWND_TOPMOST, n, 0, j, l, SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE);
+    UpdateIslandDisplay(o, 1.0f, 255);
 }
 
 // 定时触发唯一入口：两条触发链都走这里，本分钟只放行一次。
@@ -2316,6 +2914,8 @@ void TriggerAlarmByTimer(AlarmType type)
     int curMin = st.wHour * 60 + st.wMinute;
     if (N == curMin) return;      // 本分钟已经弹过了，吞掉
     N = curMin;
+    // 2026-10-13 用户改回去了：放学（今天最后一节课下课）**照常敲下课铃**，
+    // 《回家》挪到固定 19:30 单独播（见 case 10 里的 BGM_HOUR/BGM_MIN）。
     AudioPlayAsync(type);        // 后台放音：别让 MCI 的启动耗时挡住岛的动画
     TriggerAlarm(type);
 }
@@ -2335,20 +2935,31 @@ void TriggerAlarm(AlarmType type)
     O=0; P=0;
     af = false; ww = 0;                     // 收起"长按关闭"提示
     ja = 0; he = false; hs = 0; ta = 255;   // 清掉上一轮的衔接窗口与"两段式"状态
-    // 特殊日期（中秋/国庆，含前一天）：正好是"今天最后一节课下课"（放学）时，
-    // 先照常显示「下课了」+ 时间；等它显示完，再让文字淡出、换上「国庆节快乐」
-    // （走 J=10 两段式，见 AnimTick）—— 所以这里只登记"待会儿要接祝福"，不打断正常下课流程
-    if (type == ALARM_TYPE_CLASS_END && HolidayToday() && !HolidayEggShownToday())
+
+    // 这一轮是不是"今天最后一节课下课"（放学）。下面两处都要用，先算一次
+    bool lastEnd = false;
+    if (type == ALARM_TYPE_CLASS_END)
     {
         SYSTEMTIME st; GetLocalTime(&st);
-        if (IsLastClassEndOfDay(st.wHour * 60 + st.wMinute))
-        {
-            MarkHolidayEggShown();
-            he = true;
-        }
+        lastEnd = IsLastClassEndOfDay(st.wHour * 60 + st.wMinute);
     }
-    // 常驻小岛正显示时，大岛要"直接变身放大"，而不是从最小尺寸重新弹一次（免得闪一下）
+    // 播放器还开着（《回家》在放）又来了别的提醒 → 先把它收掉，别跟这一轮的大岛抢画面
+    if (ply && !lastEnd) { BgmStop(); ply = false; bgmPause = false; plyPauseAt = 0; }
+    // 普通闹钟一律回到标准高度；播放器那个更高的长方形由 ShowPlayerIsland 单独设
+    bigH = ISLAND_HEIGHT;
+
+    // 特殊日期（中秋/国庆，含前一天）：正好是放学的时侯，
+    // 先照常显示「下课了」+ 时间；等它显示完，再让文字淡出、换上「国庆节快乐」
+    // （走 J=10 两段式，见 AnimTick）—— 所以这里只登记"待会儿要接祝福"，不打断正常下课流程
+    if (lastEnd && HolidayToday() && !HolidayEggShownToday())
+    {
+        MarkHolidayEggShown();
+        he = true;
+    }
+    // 放学不再放《回家》了：音乐改成固定 19:30 播（case 10 里触发），放学这一下只打铃。
     bool wasMini = (J == 6 || J == 7 || J == 11 || J == 12);
+    sf0 = 0.0f;                                 // 迷你岛也改圆角了，sf 恒 0（不再有"上两角直角"这套）
+    sf1 = 0.0f;
     if (J == 11 || J == 12) nt = false;        // 迷你岛 → 交给变身接管，形状切回普通圆角
     if (type == ALARM_TYPE_CLASS_END)
     {
@@ -2365,6 +2976,13 @@ void TriggerAlarm(AlarmType type)
     ai = -1;
     hh = false;                              // 真闹钟显示时间，不显示上一条消息
     M=type; L=true;
+    {   // 大岛宽度随文字自适应：量"事件标签"和"时间"里更宽的那个（节日多量一个后缀的宽度）
+        wchar_t lb[32] = {0}, tm[24] = {0};
+        AlarmLabel(type, lb);
+        SYSTEMTIME st; GetLocalTime(&st);
+        swprintf_s(tm, L"%02d:%02d", st.wHour, st.wMinute);
+        FitBigWidth(lb, tm, HolidayToday() ? L"00●" : NULL);
+    }
     if (wasMini)
     {
         ae = F; an = G; ao = E;              // 从小岛/迷你岛"当前"尺寸接着长，接缝处不跳变
@@ -2374,6 +2992,7 @@ void TriggerAlarm(AlarmType type)
     else
     {
         vv0 = 0.0f; vt = 0.0f; vv = 0.0f;    // 大岛文字从实心开始
+        sf = 0.0f; sf0 = 0.0f; sf1 = 0.0f;   // 从零弹出的大岛＝普通圆角（别漏成迷你岛的直角）
         J = 1;
     }
     {   // 记录本分钟已触发，避免"定时线程"与"每分钟兜底检查"重复弹出两次
@@ -2408,9 +3027,13 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 
     // 鼠标按在岛上：显示提示 + 开始长按计时
     case WM_LBUTTONDOWN:
+    {
+        POINT cp; GetCursorPos(&cp);               // 这条消息的 lParam 是客户区坐标，命中要用屏幕坐标
+        if (PlayerButtonHit(cp)) return 0;         // 点在播放/暂停键上 → 只切播放状态，别起长按
         if (!xx) { xx = true; yy = NowMs(); af = true; SetTimer(hWnd, 12, 100, NULL); }
         SetCapture(hWnd);
         return 0;
+    }
     case WM_LBUTTONUP:
         xx = false; af = false;
         if (GetCapture() == hWnd) ReleaseCapture();
@@ -2421,8 +3044,12 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 
     // 触控（指针模型）：Windows 会把触摸派发为 WM_POINTER
     case WM_POINTERDOWN:
+    {   // WM_POINTER 的 GET_X/Y_LPARAM 给的就是屏幕坐标，正好直接拿去命中
+        POINT cp = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+        if (PlayerButtonHit(cp)) return 0;
         if (!xx) { xx = true; yy = NowMs(); af = true; SetTimer(hWnd, 12, 100, NULL); }
         return 0;
+    }
     case WM_POINTERUP:
     case WM_POINTERCAPTURECHANGED:
         if (xx) { xx = false; af = false; }
@@ -2439,6 +3066,9 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
             {
                 if (ti[k].dwFlags & TOUCHEVENTF_DOWN)
                 {
+                    // TOUCHINPUT 的坐标单位是 1/100 像素、且是屏幕坐标
+                    POINT cp = { (LONG)(ti[k].x / 100), (LONG)(ti[k].y / 100) };
+                    if (PlayerButtonHit(cp)) continue;
                     if (!xx) { xx = true; yy = NowMs(); af = true; SetTimer(hWnd, 12, 100, NULL); }
                 }
                 if (ti[k].dwFlags & TOUCHEVENTF_UP)
@@ -2458,6 +3088,11 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
             TriggerAlarmManual(ALARM_TYPE_SINGLE);      // 快捷键同样是"手动"，也绕开每分钟去重
         else if (wParam == HOTKEY_ID_SETTINGS)
             ShowSettingsWindow(o);                      // Ctrl+Alt+S：打开设置（以前注册了却没接上）
+        else if (wParam == HOTKEY_ID_PLAYER)            // Ctrl+Alt+P：测试键 —— 直接弹出播放器样式的大岛
+        {
+            BgmPlay();
+            ShowPlayerIsland();
+        }
         break;
 
     case WM_TRAYICON:
@@ -2483,6 +3118,20 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         case ID_TRAY_SETTINGS:
             ShowSettingsWindow(hWnd);
             break;
+        case ID_TBL_OLD:
+        case ID_TBL_WINTER:
+        case ID_TBL_W4:
+        {
+            int w = LOWORD(wParam);
+            tbl = (w == ID_TBL_OLD) ? 0 : (w == ID_TBL_WINTER ? 1 : 2);
+            pc = (tbl == 0) ? 11 : 9;
+            ff = (tbl == 0) ? ffA : (tbl == 1 ? ffB : ffC);
+            SaveTimeTable();
+            LoadAlarmTimes();          // 换表 → 重新载入时间
+            LoadPeriodEnabled();       // 勾选位跟着新表重新对应
+            if (J == 3 || J == 12) UpdateIslandDisplay(hWnd, 1.0f, 255);
+            break;
+        }
         case ID_TRAY_HOLIDAY:
             hon = !hon;
             SaveHolidayCfg();
@@ -2511,7 +3160,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
                 MINI_WIDTH, MINI_HEIGHT,
                 fuck ? L"开" : L"关", ab, FUCK,
                 nn[0] ? nn : L"未找到 alin.mp3",
-                am ? L"已装钩子" : L"轮询模式",
+                L"轮询",
                 (HolidayToday() == 0) ? L"今天不是节日" : HolidayGreet(),
                 j, l,
                 g, ISLAND_HEIGHT);
@@ -2532,16 +3181,13 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
             SaveAudioCfg();
             if (!fuck) AudioStop();
             break;
-        case ID_TRAY_AUDIO_VOL:
-            ShowVolumeWindow(hWnd);
-            break;
-        case ID_TRAY_UPDATENOTES: ShowUpdateNotes(); break;
+        // 独立音量面板（全自绘那个小窗）2026-10-13 用户要求删掉，入口一并撤了。
         case ID_TRAY_UNINSTALL: DoUninstall(false); break;
         case ID_TRAY_EXIT: DestroyWindow(hWnd); break;
         default:
         {
             int periodIdx = LOWORD(wParam) - ID_PERIOD_BASE;
-            if (periodIdx >= 0 && periodIdx < PERIOD_COUNT)
+            if (periodIdx >= 0 && periodIdx < pc)
             {
                 SetPeriodEnabled(periodIdx, !PeriodEnabled(periodIdx));
                 SavePeriodEnabled();
@@ -2572,6 +3218,44 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
                     break;
                 }
             }
+
+            int nowMin = st.wHour * 60 + st.wMinute;
+
+            // ⓪ 麦克风 / 摄像头被占用 → 弹岛提示（每秒看一眼，只在"刚被占用"那一下弹）
+            PrivacyTick();
+            if (privWait && (J == 0 || J == 3 || J == 11 || J == 12))
+            {
+                privWait = false;
+                ShowPrivacyIsland(privWant);
+            }
+
+            // ① 《回家》固定 19:30 播（用户 2026-10-13 从"放学那一下"挪过来的）。
+            //    和下课铃完全解耦：放学照常打铃，音乐到点自己响。
+            //    nb 每分钟都跟着走，所以第二天同一时刻还会再触发（只比"小时:分"会漏掉第二天）。
+            if (nb != nowMin)
+            {
+                nb = nowMin;
+                if (st.wHour == BGM_HOUR && st.wMinute == BGM_MIN && bgmOn && !bgmPlay)
+                {
+                    BgmPlay();
+                    if (bgmPlay) ShowPlayerIsland();   // 音乐真起来了才弹播放器岛
+                }
+            }
+
+            // ② 全局上课倒计时：只要"这会儿在课间"，就该有小岛显示倒计时，**不看这一节有没有打钩**
+            //    （打钩只管铃声）。原来只有"打了钩的下课闹钟"才会顺手把小岛叫出来，
+            //    于是没打钩的课间彻底没有倒计时 —— 用户报的就是这个。
+            //    J==0 是空屏、11/12 是迷你岛挂着，这两种情况都该让位给倒计时小岛；
+            //    大岛/变身(j1/3/4/5/9/10)优先，不抢。
+            if (J == 0 || J == 11 || J == 12)
+            {
+                LONGLONG t0 = 0;
+                if (BreakInfoActive(&t0))
+                {
+                    if (!bb) { pp = true; rr = t0; bb = true; ShowMiniIsland(); }
+                    else if (pp && rr != t0) { rr = t0; ai = -1; }
+                }
+            }
         }
         break;
 
@@ -2586,11 +3270,27 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         }
         break;
 
+    // 《回家》放完（MCI 的 notify 回调）：自动把播放器岛收掉。
+    // 只有 SUCCESSFUL 才算"自然放完" —— 我们自己 close 时来的是 ABORTED，不能当成放完处理。
+    case MM_MCINOTIFY:
+        if (wParam == MCI_NOTIFY_SUCCESSFUL && ply)
+        {
+            BgmStop();
+            bgmPause = false; plyPauseAt = 0;
+            // ply 先留着 —— 收回这段还要保持"播放器内容"，不然会闪一下普通闹钟的字；
+            // 真正的清理在 J=4 收回动画走完那一步
+            if (J == 1 || J == 3) { P = 0; J = 4; }
+            R = NowMs();
+        }
+        return 0;
+
     case WM_DESTROY:
         KillTimer(hWnd,10);
         RemoveTrayIcon(hWnd);
         UnregisterHotKey(hWnd,HOTKEY_ID_DEBUG);
         UnregisterHotKey(hWnd,HOTKEY_ID_SETTINGS);
+        UnregisterHotKey(hWnd,HOTKEY_ID_PLAYER);
+        CoverFree();                       // 封面缓存
         CleanupCachedResources();
         PostQuitMessage(0);
         break;
@@ -2619,7 +3319,7 @@ void ToggleAutoStart()
     {
         if (RegOpenKeyEx(HKEY_CURRENT_USER, szSubKey, 0, KEY_SET_VALUE, &hKey)==ERROR_SUCCESS)
         { RegDeleteValue(hKey, szValueName); RegCloseKey(hKey); }
-        ShowMessageIsland(L"开机自启动已关闭");
+        ShowMessageIsland(L"开机自启动已关闭");     // 开/关都回一句，不然点了没有任何反馈
     }
     else
     {
@@ -2633,7 +3333,6 @@ void ToggleAutoStart()
 
 void Cleanup()
 {
-    if (ad) { UnhookWindowsHookEx(ad); ad = NULL; }
     if (kk) SetEvent(kk);
     if (mm) WaitForSingleObject(mm, 5000);
     if (ll) CloseHandle(ll);
@@ -2642,65 +3341,7 @@ void Cleanup()
     timeEndPeriod(1);
 }
 
-void ShowUpdateNotes()
-{
-    const wchar_t* msg =
-        L"mobile v1.0\n\n"
-        L"【这是什么】\n"
-        L"• 教室用的上下课提醒：到点弹一个「岛」，同时按设定的音量响铃\n"
-        L"• 单文件、免安装：双击就自己装好，并常驻在托盘里\n\n"
-        L"【三档岛】\n"
-        L"• 大岛：上课 / 下课 / 自定义提醒时弹出，显示事件和时间，约 5 秒后收回\n"
-        L"• 小岛：课间出现，显示「距上课 mm:ss」倒计时；每个课间都会出现\n"
-        L"• 迷你岛：贴在屏幕顶边的刘海小时钟，只显示实时时间；\n"
-        L"  静止 10 秒后自动降到约一半透明，平时不挡桌面\n\n"
-        L"【提醒音】\n"
-        L"• 上课铃、下课铃可分别调音量，都能先试听\n"
-        L"• 只有「打了钩」的时段才会响铃；没打钩的时段只显示倒计时、不响铃\n\n"
-        L"【特殊节日】\n"
-        L"• 中秋、国庆（含节日前一天）自动换节日配色，时间后面缀 ● / ★\n"
-        L"• 当天最后一节课下课后：先显示「下课了」+ 时间，再渐渐换成「国庆节快乐」\n"
-        L"• 不想要节日皮肤：设置里把「特殊节日提醒」取消打钩即可\n\n"
-        L"【设置】\n"
-        L"• 托盘图标上右键 →「设置…」：时段勾选、提醒音、主题、迷你岛、开机自启动都在里面\n"
-        L"• 改动立即生效并自动保存，不用重启\n\n"
-        L"【操作】\n"
-        L"• 长按小岛 / 迷你岛：把它关掉\n"
-        L"• 从屏幕顶边往下滑：展开迷你岛（触控屏同样支持）\n"
-        L"• Ctrl+Alt+A：立刻弹一次大岛（测试用）\n"
-        L"• Ctrl+Alt+S：打开设置窗口\n\n"
-        L"【卸载】\n"
-        L"• 命令行运行 mobile-v1.0.exe --uninstall";
 
-    MessageBox(NULL, msg, L"mobile 更新速递", MB_OK | MB_ICONINFORMATION);
-}
-
-void ShowUpdateNotesIfFirstRun()
-{
-    const wchar_t* szSubKey = L"Software\\IslandAlarm";
-    const wchar_t* szValueName = L"UpdateNotesShown_m1.0";
-
-    HKEY hKey;
-    if (RegOpenKeyEx(HKEY_CURRENT_USER, szSubKey, 0, KEY_READ, &hKey) == ERROR_SUCCESS)
-    {
-        DWORD dwData = 0, dwSize = sizeof(dwData);
-        if (RegQueryValueEx(hKey, szValueName, NULL, NULL, (LPBYTE)&dwData, &dwSize) == ERROR_SUCCESS)
-        {
-            RegCloseKey(hKey);
-            return;
-        }
-        RegCloseKey(hKey);
-    }
-
-    ShowUpdateNotes();
-
-    if (RegCreateKeyEx(HKEY_CURRENT_USER, szSubKey, 0, NULL, 0, KEY_SET_VALUE, NULL, &hKey, NULL) == ERROR_SUCCESS)
-    {
-        DWORD dwData = 1;
-        RegSetValueEx(hKey, szValueName, 0, REG_DWORD, (LPBYTE)&dwData, sizeof(dwData));
-        RegCloseKey(hKey);
-    }
-}
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow)
 {
@@ -2727,8 +3368,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     }
 
     EnableDpiAwareness(); // 必须在建窗口前：缩放屏下防坐标错位
+    {   // 专辑封面走 GDI+ 解码，进程内起一次即可（退出时系统会回收，不必手工 Shutdown）
+        ULONG_PTR tok = 0;
+        Gdiplus::GdiplusStartupInput gin;
+        Gdiplus::GdiplusStartup(&tok, &gin, NULL);
+    }
     T = GetOsBuild();
     timeBeginPeriod(1);
+    LoadTimeTable();      // 先定作息表（决定时段数与名字），再读勾选和时间
     LoadAlarmTimes();
     LoadPeriodEnabled();
     LoadTheme();
@@ -2737,13 +3384,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     CreateTrayIcon(o);
     RegisterHotKey(o, HOTKEY_ID_DEBUG, MOD_CONTROL|MOD_ALT, 'A');
     RegisterHotKey(o, HOTKEY_ID_SETTINGS, MOD_CONTROL|MOD_ALT, 'S');   // Ctrl+Alt+S = 打开设置
+    RegisterHotKey(o, HOTKEY_ID_PLAYER, MOD_CONTROL|MOD_ALT, 'P');     // Ctrl+Alt+P = 测试播放器岛
     StartTimerThread();
     SetTimer(o, 10, 1000, NULL);
-    ad = SetWindowsHookExW(WH_MOUSE_LL, LowLevelMouseProc, GetModuleHandleW(NULL), 0);
-    am = (ad != NULL);
-    if (!am) SetTimer(o, 12, 120, NULL);     // 钩子装不上 → 常驻心跳跑轮询兜底
+    // 不装全局鼠标钩子了：WH_MOUSE_LL 是安全软件（含 Defender）重点盯的行为之一。
+    // 改成常驻心跳轮询 —— 鼠标和触控都能查到，功能一样，启动路径里少一个可疑 API。
+    SetTimer(o, 12, 120, NULL);
 
-    ShowUpdateNotesIfFirstRun();
     LoadNotchCfg();
     if (ns)                                   // 迷你岛就是这个程序的"常驻形态"：开机就挂上
     {
@@ -2775,13 +3422,15 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         else if (J == 3)
         {
             LONGLONG now = NowMs();
+            if (ply) PlayerTick();           // 播放器：把"长按关闭播放器"那行提示淡出去
             if (now >= S)
             {
                 if (he)      { he = false; hs = 0; ta = 255; J = 10; }   // 特殊日期 → 接"两段式"，大岛形状不动
-                else if (bb) { ae = F; an = G; ao = E; gw = MINI_WIDTH; gh = MINI_HEIGHT; gy = ISLAND_FINAL_Y; gJ = 7;
-                               vv0 = vv; vt = 1.0f; oo = 0; J = 5; }               // 有常驻小岛 → 直接变身
-                else if (ns) { ae = F; an = G; ao = E; gw = NOTCH_WIDTH; gh = NOTCH_HEIGHT; gy = 0; gJ = 12;
-                               vv0 = vv; vt = 1.0f; oo = 0; nt = false; J = 5; }   // 迷你岛开着 → 直接缩成迷你岛
+                else if (ply) { ShowPlayerIsland(); }                    // 放学音乐在放 → 大岛原地变播放器并常驻
+                else if (bb) { hh = false; ae = F; an = G; ao = E; gw = MINI_WIDTH; gh = MINI_HEIGHT; gy = ISLAND_FINAL_Y; gJ = 7;
+                               vv0 = vv; vt = 1.0f; oo = 0; sf0 = sf; sf1 = 0.0f; J = 5; }   // 有常驻小岛 → 直接变身
+                else if (ns) { hh = false; ae = F; an = G; ao = E; gw = NOTCH_WIDTH; gh = NOTCH_HEIGHT; gy = NOTCH_Y; gJ = 12;
+                               vv0 = vv; vt = 1.0f; oo = 0; nt = false; sf0 = sf; sf1 = 0.0f; J = 5; }   // 迷你岛开着 → 直接缩成迷你岛
                 else         { J = 4; P = 0; }               // 否则照常收回
                 R = now;
             }
@@ -2789,6 +3438,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
             if (remain < 1) remain = 1;
             if (remain > 60000) remain = 60000;
             wait = (DWORD)remain;
+            // 播放器定格时 S 被顶到 10 分钟后，不能让循环一口气睡 60 秒 ——
+            // 那样下面那行提示就没法淡出了。提示还在淡的时候 60ms 一拍，淡完降到 500ms。
+            if (ply)
+            {
+                DWORD pw = (ww > 0 || bgmPause) ? 60 : 500;   // 暂停时要盯 5 秒的自动关闭
+                if (wait > pw) wait = pw;
+            }
         }
         else if (J == 7)
         {
@@ -2797,7 +3453,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         }
         else if (J == 12)
         {
-            F = NOTCH_WIDTH; G = NOTCH_HEIGHT; E = 0; D = (B - F) / 2;
+            F = NOTCH_WIDTH; G = NOTCH_HEIGHT; E = NOTCH_Y; D = (B - F) / 2; sf = 0.0f;
             NotchHoldTick();         // 迷你岛：分钟跳变重绘 + 静止够久降半透明
             wait = 33;
         }
