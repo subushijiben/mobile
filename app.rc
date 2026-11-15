@@ -1,0 +1,41 @@
+// 资源脚本：图标 + 清单 + 版本信息
+// 这三个原来只存在于作者本机，仓库里没有 → 别人（包括后来接手的人）怎么也编不出一样的 exe。
+// 补进来，build.bat 用 windres 先编成 app_res.o 再链。
+//   windres app.rc -O coff -o app_res.o
+//
+// 注意：版本号必须跟着发版改。程序的自安装逻辑靠这个值比较新旧，
+// 没有它 exe 的 FileVersion 就是空的，新版永远覆盖不了已装好的旧版。
+
+#include <winver.h>
+
+1 ICON "app.ico"
+
+1 24 "app.manifest"
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION    1,2,0,0
+ PRODUCTVERSION 1,2,0,0
+ FILEFLAGSMASK  0x3fL
+ FILEFLAGS      0x0L
+ FILEOS         0x40004L
+ FILETYPE       0x1L
+ FILESUBTYPE    0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "080404b0"
+        BEGIN
+            VALUE "CompanyName",      "mobile"
+            VALUE "FileDescription",  "mobile"
+            VALUE "FileVersion",      "1.2.0.0"
+            VALUE "InternalName",     "mobile"
+            VALUE "OriginalFilename", "mobile-v1.2-Turbo.exe"
+            VALUE "ProductName",      "mobile Turbo"
+            VALUE "ProductVersion",   "1.2.0.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x804, 1200
+    END
+END

@@ -1,62 +1,87 @@
 # mobile · 教室上下课提醒
 
-一个 Windows 桌面小工具：到上下课时间，屏幕顶部会弹出一个类似手机「灵动岛」的提醒并响铃。单文件、免安装，双击即可自动部署并常驻托盘。
+一个 Windows 桌面小工具：到上下课时间，屏幕顶部弹出一个类似手机「灵动岛」的提醒并响铃。单文件、免安装，双击即自动部署并常驻托盘。
 
-界面使用 Win32 API + 分层窗口（Layered Window）全自绘；AI 岛的气泡排版借助第三方 HTML 渲染库 [litehtml](https://github.com/litehtml/litehtml)（底层用 [gumbo](https://github.com/google/gumbo-parser) 解析 HTML）。
+界面用 Win32 API + 分层窗口（Layered Window）全自绘，没有运行时依赖。
 
-## 功能特性
+## 两条线
 
-- **多档「岛」**
-  - 大岛：上课 / 下课 / 自定义提醒时弹出，显示事件与时间，约 5 秒后自动收回；宽度随文字自适应
-  - 小岛：课间出现，显示「距上课 mm:ss」倒计时；**只要处于课间就显示**（打钩只控制铃声，倒计时全局生效）
-  - 迷你岛：贴在屏幕顶边的刘海式小时钟，只显示实时时间；静止 10 秒后自动降到约半透明，悬浮样式、四角全圆角
-  - 消息岛：多条消息以气泡形式并排（最多 6 条）
-- **AI 岛**：点岛唤出的对话界面，带天空背景（日出 / 日落随时间变化，星星月亮），气泡用 litehtml 排版；支持连续对话，消息岛从下方冒出时 AI 岛不退出。API Key 用 **DPAPI 加密**存本机（绑定当前用户和机器，注册表被拷走也解不开），界面不回显
-- **每节课独立铃声**：每节课的上课铃 / 下课铃可分别勾选并调音量；开关用位掩码存储，22 个音量打包成一个二进制值
-- **放学《回家》**：每天固定 19:30 自动播放同目录的 `Home.mp3`，大岛变成音乐播放器（左封面 / 中歌名 / 右播放-暂停键），封面读同目录的 `Home.jpg`
-- **实时天气**：后台线程通过 WinHTTP 拉取，超时短、失败静默
-- **麦克风 / 摄像头占用提示**：设备被占用时弹出大岛，左侧自绘图标 + 右侧文字。数据来自 Windows 系统隐私设备使用记录，只读
-- **三套作息表**：初四夏季 / 冬季（默认）/ 初四冬季，在设置窗口里随时切换
-- **图形设置窗口**：左侧导航分页（作息表 / 时间提醒 / AI 岛 / 主题 / 迷你岛 / 更多），导航栏底部常驻运行状态（运行中 / 现在时间 / 下次提醒），改动即时生效并自动保存
-- **11 步全功能自检**：设置里「立即测试」会依次演示收展、上下课、课间小岛、静置变淡、AI 岛、消息岛、播放器等全部形态（约 37 秒，期间屏蔽真实闹钟）
-- **特殊节日皮肤**：中秋、国庆（含节前一天）自动切换节日配色，可在设置中关闭
-- **操作方式**
-  - 长按小岛 / 迷你岛：关闭
-  - 从屏幕顶边向下滑：展开迷你岛（支持触控屏）
-  - `Ctrl + Alt + A`：立刻弹一次大岛（测试用）
-  - `Ctrl + Alt + S`：打开设置窗口
-- 设置保存在注册表 `HKCU\Software\IslandAlarm`
+| 线 | 源码 | 发布产物 | 依赖 |
+| --- | --- | --- | --- |
+| 主线 v1.2 | `mobile.cpp` | `mobile-v1.2.exe` | litehtml + gumbo（AI 岛气泡排版） |
+| **Turbo** | `turbo.cpp` | `mobile-v1.2-Turbo.exe` | 无，约 449 KB |
+
+Turbo 是从 v1.2 分出来的**减法支线**：砍掉没做完的 AI 岛与多岛并行，修触控点击和夜间天色，顺手把每帧白算的活儿去掉。单文件 10477 → 7844 行，exe 2.1 MB → 449 KB。
+
+两条线**可以同时装在一台机器上**：安装目录（`%LOCALAPPDATA%\IslandAlarmTurbo`）、注册表键（`HKCU\Software\IslandAlarmTurbo`）、单实例标识、开机自启动项全是分开的，互不覆盖。
+
+## 功能
+
+- **三档「岛」**
+  - 大岛：上课 / 下课 / 自定义提醒 / 麦克风摄像头占用时弹出，显示事件与时间，约 5 秒收回，宽度随文字自适应
+  - 小岛：课间显示「距上课 mm:ss」倒计时，只要处于课间就在
+  - 迷你岛：贴屏幕顶边的刘海式时钟，静止 6 秒后自动降到半透明
+- **底板模式**：天气模式（底板跟着实时日出日落、云雨雪走）/ 纯色模式（原来那块深灰底）。选纯色时「天空亮度 / 天空动画」自动灰掉
+- **每节课独立铃声**：11 个节次，每节的上课铃 / 下课铃分别勾选并拖音量；开关用位掩码存储，22 个音量打包成一个二进制值
+- **放学《回家》**：每天 19:30 播放同目录的 `Home.mp3`，大岛变音乐播放器（左封面 / 中歌名 / 右播放-暂停），封面读 `Home.jpg`
+- **实时天气**：后台线程走 WinHTTP，超时短、失败静默
+- **麦克风 / 摄像头占用提示**：设备被占用时弹大岛，左侧自绘图标 + 右侧文字；数据只读 Windows 自己的隐私设备使用记录
+- **自定义提醒**：大岛文字可改；能加「一次性倒计时 / 定时」提醒；时间段可增删改
+- **三套作息表**：初四夏季 / 冬季（默认）/ 初四冬季
+- **图形设置窗口**：左侧导航 6 页（作息表 / 时间提醒 / 自定义 / 主题 / 迷你岛 / 更多），底部常驻运行状态（运行中 / 现在时间 / 下次提醒），改完即生效并自动保存
+- **「立即测试」**：依次演示迷你岛收展、上下课大岛、课间小岛、静置变淡、播放器（约 28 秒，期间屏蔽真实闹钟）
+- **节日皮肤**：中秋、国庆（含前一天）自动换配色，可在「主题」页关掉
+- **触控**：点击 / 长按 / 顶边下滑都按指针消息处理，手指和鼠标一套逻辑（挪动超过 12px 算拖动，250ms 内只认一次）
+
+### 操作
+
+| 动作 | 效果 |
+| --- | --- |
+| 长按小岛 / 迷你岛 | 关闭 |
+| 从屏幕顶边向下滑 | 展开迷你岛 |
+| 点迷你岛 / 小岛 | 弹「下节课是…」之类的信息 |
+| `Ctrl + Alt + A` | 立刻弹一次大岛 |
+| `Ctrl + Alt + S` | 打开设置 |
+| `Ctrl + Alt + P` | 演示播放器岛 |
+| 托盘图标右键 | 设置… / 退出 |
+
+## 相比主线删掉了什么
+
+- **AI 岛**：对话界面、litehtml 气泡排版、DPAPI 加密的 API Key，以及首次启动搬配置时的 AI 相关项
+- **消息岛 / 多岛并行**：岛下方挂原岛、多条消息堆叠
+- **「浅色 / 深色」主题**：有了天空背景之后底板跟着太阳走，这个概念没有落点，被「底板模式」取代
+- **litehtml、gumbo 两个静态库**：exe 从 2.1 MB 掉到 449 KB 的主因
 
 ## 快速开始
 
-到 [Releases](../../releases) 下载最新版本的完整包（`moblie.zip`），解压后包含：
+到 [Releases](../../releases) 下载 `mobile.zip`，解压后是：
 
-- `mobile-v1.2.exe`：主程序
+- `mobile-v1.2-Turbo.exe`：主程序
 - `alin.mp3`：上课 / 下课提醒音
 - `Home.mp3`：放学《回家》
-- `Home.jpg`：音乐播放器封面（可选，没有就不显示封面）
-- `smtc_probe.exe`：附带的辅助工具
+- `Home.jpg`：播放器封面
+- `check.exe`：自检工具，控制台程序，跑完在同目录生成 TXT 报告
 
-把这些文件放在**同一个目录**，双击 `mobile-v1.2.exe` 即可：程序会自动完成部署、把数据文件搬进安装目录并常驻托盘。使用 AI 岛前，在「设置 → AI 岛」里填入你的 API Key。
+放**同一个目录**，双击 exe 即可：自动安装到 `%LOCALAPPDATA%\IslandAlarmTurbo` 并常驻托盘。
+
+首次运行等于全新安装，作息表勾选、音量这些要重新配一次；以后升级只覆盖安装目录里的同名 exe，设置保留。确认新版没问题后，把旧版从托盘退出，再走它自己的卸载。
 
 ## 从源码编译
 
-### 环境要求
+需要 Windows 10 及以上 + MinGW-w64（GCC，支持 C++17），例如 MSYS2。
 
-- Windows 10 及以上
-- [MinGW-w64](https://www.mingw-w64.org/) 工具链（GCC，支持 C++17），例如 MSYS2、Dev-C++ 自带的 g++
-- 第三方库 **litehtml** 与 **gumbo**（需自行编译，得到 `liblitehtml.a`、`libgumbo.a` 及头文件）
+### Turbo（无第三方依赖）
 
-### 准备依赖
-
-下载并编译两个第三方库：
-
-```
-git clone https://github.com/litehtml/litehtml.git
-git clone https://github.com/google/gumbo-parser.git
+```bat
+windres app.rc -O coff -o app_res.o
+g++ -O2 -std=c++17 -mwindows -static -s -o mobile-v1.2-Turbo.exe turbo.cpp app_res.o ^
+    -luser32 -lgdi32 -lmsimg32 -lgdiplus -lwinhttp -ladvapi32 -lversion ^
+    -lshell32 -lwinmm -lole32 -luuid -lcomctl32
 ```
 
-按各自说明编译后，在仓库根目录建 `third_party` 目录，放成如下结构：
+### 主线（还要 litehtml + gumbo）
+
+两个库需自行编译，然后按下面的结构放（或改 `LITEHTML_DIR` / `GUMBO_DIR`）：
 
 ```
 third_party\
@@ -68,26 +93,34 @@ third_party\
     └── libgumbo.a
 ```
 
-### 编译命令
-
 ```bat
-g++ -O2 -std=c++17 -mwindows -static -s -o mobile.exe mobile.cpp ^
+g++ -O2 -std=c++17 -mwindows -static -s -o mobile-v1.2.exe mobile.cpp app_res.o ^
     -I"third_party\litehtml\include" -I"third_party\gumbo\src" ^
     -L"third_party\litehtml" -L"third_party\gumbo" ^
-    -luser32 -lgdi32 -lmsimg32 -lgdiplus -lwinhttp -limm32 -ladvapi32 -lcrypt32 ^
+    -luser32 -lgdi32 -lmsimg32 -lgdiplus -lwinhttp -limm32 -ladvapi32 -lcrypt32 -lversion ^
     -lshell32 -lwinmm -lole32 -luuid -lcomctl32 ^
     -llitehtml -lgumbo
 ```
 
-也可以直接运行仓库中的 `build.bat`（依赖路径可用环境变量 `LITEHTML_DIR`、`GUMBO_DIR` 覆盖）。
+`build.bat` 默认编 Turbo；`build.bat mobile` 编主线；`build.bat check` 编自检工具。
 
-各库用途：`-lgdiplus` 解码封面图片；`-lwinhttp` 取实时天气与 AI 请求；`-limm32` 控制输入法候选窗；`-lcrypt32` 提供 DPAPI 加密；`-llitehtml -lgumbo` 渲染 AI 岛气泡。
+### 链接库都是干嘛的
 
-> 原项目编译命令中的 `app_res.o` 仅含可选的版本信息资源，程序本身不依赖自定义资源（托盘图标使用系统默认图标），不链接它不影响功能。
+| 库 | 用途 |
+| --- | --- |
+| `-lgdiplus` | 解码 `Home.jpg` 封面 |
+| `-lwinhttp` | 实时天气 |
+| `-lversion` | 读 exe 自己的版本号（自安装时比较新旧） |
+| `-lole32` | WASAPI 回环（抓系统输出算音量） |
+| `-limm32` | 主线专用：AI 岛输入框的输入法候选窗定位 |
+| `-lcrypt32` | 主线专用：DPAPI 加密 API Key |
+| `-llitehtml -lgumbo` | 主线专用：AI 岛气泡排版 |
+
+`app.rc` 里放图标、清单和 VERSIONINFO。**版本号必须跟着发版改** —— 自安装靠它判断「手里这份是不是更新」，没有它新版永远覆盖不了已装好的旧版。清单里声明了 `asInvoker` 和 comctl32 6，别删。
 
 ## 作息表
 
-内置三套作息表，在设置窗口切换，选择自动保存到注册表。时间定义在源码 `LoadAlarmTimes()` 中，需要修改时直接编辑对应数组后重新编译。
+内置三套，在设置窗口切换，选择自动保存到注册表。时间定义在源码 `LoadAlarmTimes()` 中，要改就直接改数组再重新编译。
 
 ### 冬季（默认，9 节）
 
@@ -111,15 +144,26 @@ g++ -O2 -std=c++17 -mwindows -static -s -o mobile.exe mobile.cpp ^
 
 第 1~6 节同冬季；第七节 15:25-16:10、第八节 16:15-16:55、第九节 17:05-17:45
 
-## 卸载
+## 自检工具
 
-在命令行中运行：
+`check.exe` 是个独立控制台程序，源码在 `check.cpp`，只查「能确定」的东西：系统版本、屏幕尺寸、安装目录与 exe 版本、三个音频文件在不在、注册表值合不合法、自启动项、主程序有没有在跑。运行后同目录生成一份 TXT 报告，失败项会写「可能原因 + 建议」。Turbo 版的注册表键和安装目录都带 `Turbo` 后缀，别拿查主线键的旧工具来查。
 
 ```bat
-mobile-v1.2.exe --uninstall
+check.exe          直接跑
+check.exe --keep   跑完不自动关窗口
 ```
 
-会删除桌面快捷方式与开机自启动项；设置仍保留在注册表 `HKCU\Software\IslandAlarm` 中，如需彻底清除可手动删除该键。
+自己编：`g++ -O2 -std=c++17 -municode -static -s -o check.exe check.cpp -ladvapi32 -lversion -lshell32`（或直接 `build.bat check`）。
+
+运行时行为（动画、点击判定）它看不到，那些归主程序里的「立即测试」。
+
+## 卸载
+
+```bat
+mobile-v1.2-Turbo.exe --uninstall
+```
+
+会删开机自启动项和程序目录 `%LOCALAPPDATA%\IslandAlarmTurbo`；设置仍留在 `HKCU\Software\IslandAlarmTurbo`，要彻底清就手动删这个键。卸载不影响同机安装的主线 v1.2。
 
 ## 更新日志
 
@@ -129,4 +173,4 @@ mobile-v1.2.exe --uninstall
 
 [MIT License](LICENSE)
 
-第三方依赖许可证：litehtml 为 BSD 3-Clause，gumbo 为 Apache License 2.0。
+第三方依赖许可证（仅主线用到）：litehtml 为 BSD 3-Clause，gumbo 为 Apache License 2.0。
