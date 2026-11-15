@@ -3746,6 +3746,28 @@ void UpdateIslandDisplay(HWND hWnd, float scale, BYTE alpha)
     //   时间那行字的 alpha 保持满 → 透出去的同时照样看得清。
     // 踩过的两个坑：① 只压颜色不压 alpha → 只是变暗，一点不透光；
     //             ② 用图层整体不透明度 → 字跟背景一起淡，看不清。
+    // ★ 提交前把 RGB 预乘 alpha。
+    //   AC_SRC_ALPHA 要求像素是"预乘"格式；但我们的绘制是普通 alpha 混合（非预乘），
+    //   系统再把 RGB 乘一遍 alpha → 半透明边缘的深色被压暗两次，
+    //   在浅色背景上就是一圈灰黑边（圆角处最明显，大屏上尤其扎眼）。
+    //   只处理 alpha 不全的像素（边缘），内部 255 的原样跳过。
+    {
+        int pw = (j < cc) ? j : cc;
+        for (int py = 0; py < l; py++)
+        {
+            BYTE* prow = X + (size_t)py * cc * 4;
+            for (int px = 0; px < pw; px++)
+            {
+                BYTE* q = prow + (size_t)px * 4;
+                BYTE a = q[3];
+                if (a == 255 || a == 0) continue;
+                q[0] = (BYTE)(q[0] * a / 255);
+                q[1] = (BYTE)(q[1] * a / 255);
+                q[2] = (BYTE)(q[2] * a / 255);
+            }
+        }
+    }
+
     BYTE ga = (BYTE)255;
     BLENDFUNCTION blend={AC_SRC_OVER,0,ga,AC_SRC_ALPHA};
     POINT ptSrc={0,0};
@@ -3929,6 +3951,38 @@ static bool DumpResToFile(int id, const wchar_t* dst)
     return ok;
 }
 
+// 读一个 exe 的文件版本（只用 major.minor，够比较了）
+static DWORD ExeFileVersion(const wchar_t* path)
+{
+    DWORD ver = 0;
+    DWORD sz = GetFileVersionInfoSizeW(path, NULL);
+    if (!sz) return 0;
+    std::vector<BYTE> buf(sz);
+    if (!GetFileVersionInfoW(path, 0, sz, buf.data())) return 0;
+    VS_FIXEDFILEINFO* fi = NULL;
+    UINT len = 0;
+    if (VerQueryValueW(buf.data(), L"\\", (void**)&fi, &len) && fi && len >= sizeof(VS_FIXEDFILEINFO))
+        ver = fi->dwFileVersionMS;             // 高 16 位 major、低 16 位 minor
+    return ver;
+}
+
+// 把正在跑的旧实例干掉。不这么做的话：安装目录的 exe 一直被占用，
+// 新版本永远 CopyFile 失败 → 用户双击新版却被单实例拦下，看到的还是旧版的岛。
+static bool KillRunningInstance()
+{
+    HWND h = FindWindowW(L"IslandAlarmWindow", NULL);
+    if (!h) return true;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(h, &pid);
+    if (!pid || pid == GetCurrentProcessId()) return true;
+    HANDLE hp = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, pid);
+    if (!hp) return false;
+    TerminateProcess(hp, 0);
+    WaitForSingleObject(hp, 4000);
+    CloseHandle(hp);
+    return true;
+}
+
 // false = 已交接给新实例，本进程该退了
 static bool EnsureInstalledOrRun()
 {
@@ -3940,13 +3994,33 @@ static bool EnsureInstalledOrRun()
     wchar_t exe[MAX_PATH];
     swprintf_s(exe, L"%ls\\islands.exe", dir);
 
-    bool done = (GetFileAttributesW(exe) != INVALID_FILE_ATTRIBUTES)      // 已安装过 → 正常运行
-             || (_wcsicmp(self, exe) == 0);                              // 正从安装目录运行
+    bool fromInstalled = (_wcsicmp(self, exe) == 0);                     // 正从安装目录运行
+    bool installed     = (GetFileAttributesW(exe) != INVALID_FILE_ATTRIBUTES);
+    bool done = installed || fromInstalled;
 
     if (!done)
     {   // 首次运行 → 装一下
         CreateDirectoryW(dir, NULL);
         if (!CopyFileW(self, exe, FALSE)) return true;                   // 复制失败则按便携版运行
+    }
+    else if (installed && !fromInstalled)
+    {
+        // ★ 已装过一版：比版本。只有"手里这份更新"才替换。
+        //   老逻辑是"有就跳过"，结果装了 v1.0 之后，以后所有版本都覆盖不上去，
+        //   用户双击新版 → 被单实例拦住 → 看到的永远是旧版（2026-10-29 踩到）。
+        DWORD vSelf = ExeFileVersion(self);
+        DWORD vInst = ExeFileVersion(exe);
+        if (vSelf && vSelf > vInst)
+        {
+            if (KillRunningInstance())          // 先让旧实例退出（文件不占用才复制得动）
+            {
+                Sleep(250);
+                if (CopyFileW(self, exe, FALSE))
+                {
+                    done = false;               // 覆盖成功 → 走下面的"启动安装目录那份"
+                }
+            }
+        }
     }
 
     // 音频随行：每次启动都补一次，别只认首次安装。
@@ -5472,6 +5546,7 @@ HFONT sFont = NULL;
 #define ID_AI_KEY_DEL   1163   // 删除已保存的 Key
 
 static HWND sStatus = NULL;    // 导航栏底部常驻状态
+static std::wstring g_checkMsg;   // 打开设置时自检出来的问题（每行一条，空=全好）
 #define ID_SET_LOWPERF 1085   // 低配模式勾选
 #define ID_SET_CLOSE 1090
 #define ID_SET_PREV0 1091
@@ -5572,6 +5647,58 @@ static void OvShow(int alpha)
     UpdateLayeredWindow(sOvWnd, NULL, &dst, &sz, sOvDC, &src, 0, &bf, ULW_ALPHA);
     ShowWindow(sOvWnd, SW_SHOWNOACTIVATE);
     SetWindowPos(sOvWnd, stw, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+}
+
+// 设置窗口打开时跑一遍轻量自检：只查"能确定"的，结果挂在左下角。
+// 运行时行为（动画、点击）在这里看不到，那些归 check.exe。
+static void RunSelfCheck()
+{
+    g_checkMsg.clear();
+
+    // ① 提醒音
+    if (!nn[0]) AudioResolvePath();
+    if (!nn[0]) g_checkMsg += L"提醒音文件没找到\n";
+
+    // ② AI Key
+    {
+        std::wstring k;
+        if (!AiLoadKey(k)) g_checkMsg += L"AI 岛还没配 Key\n";
+    }
+
+    // ③ 注册表
+    {
+        HKEY hk;
+        if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\IslandAlarm", 0, KEY_READ, &hk) != ERROR_SUCCESS)
+            g_checkMsg += L"配置文件读不到\n";
+        else RegCloseKey(hk);
+    }
+
+    // ④ 音量数组长度（长度不对会让所有节次回到默认音量）
+    {
+        HKEY hk;
+        if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\IslandAlarm", 0, KEY_READ, &hk) == ERROR_SUCCESS)
+        {
+            DWORD sz = 0;
+            if (RegQueryValueExW(hk, L"BellVols", NULL, NULL, NULL, &sz) == ERROR_SUCCESS && sz != 22)
+                g_checkMsg += L"每节课音量数据异常\n";
+            RegCloseKey(hk);
+        }
+    }
+
+    // ⑤ 铃开关高位残留（换过作息表会有）
+    {
+        HKEY hk;
+        if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\IslandAlarm", 0, KEY_READ, &hk) == ERROR_SUCCESS)
+        {
+            DWORD mu = 0, sz = sizeof(mu);
+            if (RegQueryValueExW(hk, L"BellUpMask", NULL, NULL, (LPBYTE)&mu, &sz) == ERROR_SUCCESS)
+            {
+                DWORD valid = (pc >= 11) ? 0x7FF : ((1u << pc) - 1);
+                if (mu & ~valid) g_checkMsg += L"铃声开关有余留\n";
+            }
+            RegCloseKey(hk);
+        }
+    }
 }
 
 static void UpdateAiKeyState()
@@ -5989,12 +6116,14 @@ LRESULT CALLBACK SetProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
                     if (v > cur && (nxt < 0 || v < nxt)) nxt = v;
                 }
             }
-            wchar_t b2[192];
+            wchar_t b2[512];
             if (nxt >= 0)
-                swprintf_s(b2, L"运行中\n现在 %02d:%02d\n下次提醒 %02d:%02d", st2.wHour, st2.wMinute, nxt / 60, nxt % 60);
+                swprintf_s(b2, L"运行中\n现在 %02d:%02d  下次 %02d:%02d\n", st2.wHour, st2.wMinute, nxt / 60, nxt % 60);
             else
-                swprintf_s(b2, L"运行中\n现在 %02d:%02d\n今天没有更多提醒了", st2.wHour, st2.wMinute);
-            SetWindowTextW(sStatus, b2);
+                swprintf_s(b2, L"运行中\n现在 %02d:%02d\n今天没有更多提醒了\n", st2.wHour, st2.wMinute);
+            std::wstring txt = b2;
+            if (!g_checkMsg.empty()) txt += g_checkMsg;       // 有问题就堆在下面
+            SetWindowTextW(sStatus, txt.c_str());
         }
         return 0;
 
@@ -7159,6 +7288,7 @@ void ShowSettingsWindow(HWND owner)
         if (sBellDnVol[i2]) SendMessageW(sBellDnVol[i2], TBM_SETRANGE, TRUE, MAKELPARAM(0, 100));
     }
 
+    RunSelfCheck();
     PageApply(0);
     SetSyncControls();
     SetTimer(stw, 1, 1000, NULL);      // 状态栏每秒刷新
@@ -8014,10 +8144,25 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
             aiHistLongDone = false;
         }
         if (GetCapture() == hWnd) ReleaseCapture();
-        // 短按（<400ms）→ 打开 AI 岛。
+        // 短按 → 打开 AI 岛。
         // 迷你岛 J=12、课间小岛 J=6/7 都算；大岛在 WM_LBUTTONDOWN 里已经单独处理了。
-        // 小岛原来短按是**什么都不做**（只有长按关闭），所以这里加不影响已有操作。
-        if ((J == 12 || J == 6 || J == 7) && !aiMode && NowMs() - yy < 400) ShowAiIsland();
+        // 阈值从 400ms 放宽到 900ms：触摸一体机上按一下经常超过 400ms，
+        // 表现就是"点了没反应"（2026-10-29 用户在学校机器上踩到）。
+        {
+            LONGLONG dtc = NowMs() - yy;
+            bool want = (J == 12 || J == 6 || J == 7) && !aiMode && dtc < 900;
+            // 诊断日志落在 exe 同目录，用户能直接发回来
+            {
+                wchar_t self[MAX_PATH] = {0};
+                GetModuleFileNameW(NULL, self, MAX_PATH);
+                wchar_t* sl = wcsrchr(self, L'\\');
+                if (sl) *(sl + 1) = 0;
+                wcscat_s(self, L"click.log");
+                FILE* f = _wfopen(self, L"a");
+                if (f) { fprintf(f, "J=%d ai=%d dt=%lld want=%d\n", J, aiMode?1:0, (long long)dtc, want?1:0); fclose(f); }
+            }
+            if (want) ShowAiIsland();
+        }
         return 0;
     case WM_CAPTURECHANGED:
         if (xx) { xx = false; af = false; }
