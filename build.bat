@@ -8,16 +8,22 @@ rem   build.bat mobile   编主线（要 litehtml + gumbo）
 rem   build.bat check    编自检工具 check.exe
 rem   build.bat all      两个都编
 rem
-rem 资源（图标 / 清单 / 版本号）走 app.rc，先 windres 成 app_res.o 再链。
-rem 版本号在 app.rc 里改，别只改这里。
+rem 资源（图标 / 清单 / 版本号）走 .rc，先 windres 成 app_res.o 再链：
+rem   app.rc      → Turbo（版本 1.2.1，产品名 mobile Turbo）
+rem   app-main.rc → 主线（版本 1.2，产品名 mobile）
+rem 版本号改在对应的 .rc 里，别只改这里。
 
 set TARGET=%1
 if "%TARGET%"=="" set TARGET=turbo
 if "%LITEHTML_DIR%"=="" set LITEHTML_DIR=third_party\litehtml
 if "%GUMBO_DIR%"=="" set GUMBO_DIR=third_party\gumbo
 
-echo [1/2] 编译资源 app.rc ...
-windres app.rc -O coff -o app_res.o
+rem 主线 / Turbo 版本号与产品名不同，各用各的资源脚本
+set RCFILE=app.rc
+if /i "%TARGET%"=="mobile" set RCFILE=app-main.rc
+
+echo [1/2] 编译资源 %RCFILE% ...
+windres "%RCFILE%" -O coff -o app_res.o
 if errorlevel 1 goto resfail
 
 if /i "%TARGET%"=="mobile" goto domobile
@@ -54,7 +60,7 @@ echo 编译成功：check.exe
 goto end
 
 :resfail
-echo 资源编译失败：确认 windres 在 PATH 里，且 app.rc / app.ico / app.manifest 都在当前目录
+echo 资源编译失败：确认 windres 在 PATH 里，且 .rc / app.ico / app.manifest 都在当前目录
 goto end
 
 :buildfail

@@ -98,6 +98,7 @@ third_party\
 ```
 
 ```bat
+windres app-main.rc -O coff -o app_res.o
 g++ -O2 -std=c++17 -mwindows -static -s -o mobile-v1.2.exe mobile.cpp app_res.o ^
     -I"third_party\litehtml\include" -I"third_party\gumbo\src" ^
     -L"third_party\litehtml" -L"third_party\gumbo" ^
@@ -120,7 +121,7 @@ g++ -O2 -std=c++17 -mwindows -static -s -o mobile-v1.2.exe mobile.cpp app_res.o 
 | `-lcrypt32` | 主线专用：DPAPI 加密 API Key |
 | `-llitehtml -lgumbo` | 主线专用：AI 岛气泡排版 |
 
-`app.rc` 里放图标、清单和 VERSIONINFO。**版本号必须跟着发版改** —— 自安装靠它判断「手里这份是不是更新」，没有它新版永远覆盖不了已装好的旧版。清单里声明了 `asInvoker` 和 comctl32 6，别删。
+资源脚本有**两份**，别混用：`app.rc` 给 Turbo（版本 1.2.1 / 产品名 mobile Turbo），`app-main.rc` 给主线（版本 1.2 / 产品名 mobile）。里面放图标、清单和 VERSIONINFO。**版本号必须跟着发版改** —— 自安装靠它判断「手里这份是不是更新」，没有它新版永远覆盖不了已装好的旧版。两份分开是为了让两边的版本号互不干扰。清单里声明了 `asInvoker` 和 comctl32 6，别删。
 
 ## 作息表
 
