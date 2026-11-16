@@ -308,6 +308,9 @@ void LoadTimeTable();
 void SaveTimeTable();
 
 wchar_t gg[128] = {0};
+// P2：大岛"原地换字"用 —— 换之前的旧大字、以及这次交叉渐变的起点
+static wchar_t  g_prevBig[128] = {0};
+static LONGLONG g_swapT0 = 0;
 bool hh = false;
 POINT ii = {0,0};
 std::vector<AlarmTime> jj;
@@ -437,6 +440,13 @@ static const wchar_t* SchedSubject(int weekDay, int period)
 }
 
 bool      g_hud = false;            // 调试 HUD：岛下方显示状态（注册表 DebugHud=1 打开）
+// ===== 考试模式（2026-11-16）=====
+// 开考之后只留一条会走时间的迷你岛，别的岛一律不许弹；天空切纯色（关掉实时天气）。
+// 退出必须从托盘进设置、再输一次二级密码 —— 学生点不到"关闭"。
+bool      g_examOn = false;
+wchar_t   g_examPwd[32] = L"426426";   // 二级密码，默认 426426，可在自定义页改
+HWND      sExam = NULL;                // 作息表页顶部的开关
+HWND      sExamPwdEdit = NULL;         // 自定义页的密码框
 float     g_speedDbg = 1.0f;        // HUD 里显示的速度（动画速度功能回滚了，先占位）
 // 小岛/迷你岛 → 大岛 时，天空动画要"重新播一遍"还是"直接接着变"（注册表 SkyAnimReplay）
 // 默认不重播：我说"大岛毫无征兆地把动画抢过来重播一遍"很别扭。从空屏弹出时无所谓，一定会演。
@@ -537,6 +547,10 @@ void LoadNotchCfg();
 void SaveNotchCfg();
 void SaveHolidayCfg();
 void ShowSettingsWindow(HWND owner);
+// 考试模式（2026-11-16）
+void ApplyExamMode(bool on);
+static void SaveExamCfg();
+static void LoadExamCfg();
 void ShowTrayMenu(HWND hWnd);
 void AlarmLabel(AlarmType t, wchar_t* out);
 void FitBigWidth(const wchar_t* label, const wchar_t* big, const wchar_t* extra, int extraPx = 0);
@@ -1251,6 +1265,7 @@ void PopTick(int tw, int th, int maxStep, int* step)
 // 让常驻小岛出现（大岛正在显示时不动 —— 大岛优先，等它走完自动变身）
 void ShowMiniIsland()
 {
+    if (g_examOn) return;           // 考试模式：课间小岛/倒计时一律不许弹
     // ★ 小岛只有"课间倒计时"这一种用途。
     //   我 2026-10-27：以前那种"用小岛样式只显示时间"早就该删了 —— 那个形态已经全交给迷你岛。
     //   不在课间就不进这个形态，直接落回迷你岛，免得走出一条"仅时间的小岛"。
@@ -1653,6 +1668,7 @@ DWORD WINAPI WxThreadProc(LPVOID)
 {
     while (true)
     {
+        if (g_examOn) { Sleep(3000); continue; }   // 考试模式：不联网、不取天气
         // ⚠️ **不管有没有 WxForce 都要联网**：WxForce 只是手动指定天气种类，
         // 日出日落照样得从网络拿（实测本地简化公式差 7~8 分钟）。
         // 之前写成 force 就直接 continue，结果 force 一开就再也不联网了（踩过）。
@@ -2093,70 +2109,19 @@ static inline void SkyRowColor(const SkyState& s, double v, int* R, int* chanG, 
     *B = (int)(s.rowB[i0] + (s.rowB[i0+1] - s.rowB[i0]) * f);
 }
 
-// 云带：横向一条条的淡云。按 x 预生成一行，逐像素只查表 —— 不然每像素两次 sin 太费
+// 云带：横向一条条的淡云。按 x 预生成一行，逐像素只查表 —— 不然每像素两次 sin 太费。
+// 2026-11-16：这套是 V1.2 的算法，原样搬回来。之前 11-04 我改成"3 朵云 × 4 个椭圆"，
+// 结果横向被摊平、纵向被包络框住，看着就是一张纸。V1.2 这种"明暗交替的带子"反而更像云，
+// 而且只要一次查表（比 12 次椭圆判定快得多）。
 static double skyCloud[4096];
-// ===== 云（2026-11-04 重做）=====
-// 我要的多云：**蓝天还在**，几朵云飘过去；云本身有深有浅（不是一层灰雾）。
-// 做法：3 朵云，每朵由 4 个椭圆叠加 —— 每个椭圆亮度不同，叠起来就有体积感。
-// 位置/大小/亮度用固定种子，保证每次启动长得一样，不会闪。
-struct CloudBlob { double x, y, rx, ry, lum; };
-static CloudBlob g_cloudBlobs[3][4];
-// 每朵云的外接矩形（minX,maxX,minY,maxY）：逐像素先粗筛，不在框里就跳过 12 次圆判断
-static double g_cloudBox[3][4];
-
 static void SkyBuildClouds(const SkyState& s)
 {
-    (void)s;
-    // 一朵云从左边飘到右边 10 秒（按 640 宽算）；三朵均匀错开
-    const double W      = 640.0;
-    const double PERIOD = 10000.0;
-    double tNow = (double)(NowMs() % (LONGLONG)PERIOD) / PERIOD;   // 0..1 循环
-
-    static bool  inited = false;
-    static double rnd[3][8];
-    if (!inited)
+    // 云是固定带子：以岛中心为基准的 640 宽，岛变大变小不影响云的形状
+    const int NW = 640;
+    for (int i = 0; i < NW; i++)
     {
-        inited = true;
-        unsigned seed = 20261104u;
-        for (int i = 0; i < 3; i++)
-            for (int k = 0; k < 8; k++)
-            {
-                seed = seed * 1664525u + 1013904223u;
-                rnd[i][k] = (double)((seed >> 8) & 0xFFFFFF) / 16777216.0;
-            }
-    }
-
-    for (int i = 0; i < 3; i++)
-    {
-        double p = tNow + i / 3.0;
-        if (p >= 1.0) p -= 1.0;
-        double cx = -170.0 + p * (W + 340.0);          // 从屏幕外进、飘到屏幕外
-        double cy = 34.0 + rnd[i][0] * 86.0;           // 每朵高度不同
-        double baseR = 42.0 + rnd[i][1] * 34.0;        // 每朵大小不同
-        for (int k = 0; k < 4; k++)
-        {
-            CloudBlob& b = g_cloudBlobs[i][k];
-            b.x  = cx + (rnd[i][2] - 0.5) * baseR * 1.5;
-            b.y  = cy + (rnd[i][3] - 0.5) * baseR * 0.55;
-            b.rx = baseR * (0.50 + rnd[i][4] * 0.55);
-            b.ry = b.rx * 0.62;
-            b.lum = 0.40 + rnd[i][5] * 0.60;           // 同一个圆里的亮度，叠出深浅
-            // 四个圆错开一点，别都堆在中心
-            if (k == 1) { b.x += baseR * 0.55; b.lum *= 0.78; }
-            if (k == 2) { b.x -= baseR * 0.60; b.lum *= 0.72; }
-            if (k == 3) { b.y -= baseR * 0.18; b.lum *= 0.92; }
-        }
-        double cx0 = 1e9, cx1 = -1e9, cy0 = 1e9, cy1 = -1e9;
-        for (int k = 0; k < 4; k++)
-        {
-            const CloudBlob& b = g_cloudBlobs[i][k];
-            if (b.x - b.rx < cx0) cx0 = b.x - b.rx;
-            if (b.x + b.rx > cx1) cx1 = b.x + b.rx;
-            if (b.y - b.ry < cy0) cy0 = b.y - b.ry;
-            if (b.y + b.ry > cy1) cy1 = b.y + b.ry;
-        }
-        g_cloudBox[i][0] = cx0 - 2; g_cloudBox[i][1] = cx1 + 2;
-        g_cloudBox[i][2] = cy0 - 2; g_cloudBox[i][3] = cy1 + 2;
+        double t = i * 0.021 + s.cloudPhase;
+        skyCloud[i] = sin(t) * 0.62 + sin(t * 0.47 + 1.7) * 0.38;
     }
 }
 
@@ -2213,41 +2178,23 @@ static inline void SkyPixel(const SkyState& s, int lx, int ly, int* R, int* chan
     }
 
 
-    // 云
+    // 云：横向一条条的淡云（V1.2 的算法）
+    //   ⚠️ c 是有正有负的：正的提亮、负的压暗 —— 明暗交替才有"厚度"，
+    //   之前我用"椭圆取 max"只加不减，结果就是一层平涂的白 —— 这就是"像纸"的根。
     if (s.cloudAmp > 0.02)
     {
-        double env = 1.0 - fabs(((double)(ly - ISLAND_FINAL_Y) / ISLAND_HEIGHT) - 0.46) * 2.3;
+        // 2.3 → 1.8：包络铺得宽一点，云带不那么"细"
+        double env = 1.0 - fabs(((double)(ly - ISLAND_FINAL_Y) / ISLAND_HEIGHT) - 0.46) * 1.8;
         if (env > 0)
         {
-            // 云是 3 朵独立的，每朵 4 个椭圆叠出深浅（见 SkyBuildClouds）
-            double cl = (double)(lx - (s.cx - 320));      // 转到 0..640 的云坐标
-            double acc = 0.0;
-            for (int i = 0; i < 3; i++)
-            {
-                // 2026-11-14：先用整朵云的外接框粗筛。原来 12 个椭圆逐个算除法，
-                // 大岛一帧 3.4 万像素 × 12 次 = 40 万次，全是白算 ——
-                // 这就是"太阳动画 + 多云/下雨"最卡的地方。g_cloudBox 一直有人算，只是没人用。
-                if (lx < g_cloudBox[i][0] || lx > g_cloudBox[i][1] ||
-                    ly < g_cloudBox[i][2] || ly > g_cloudBox[i][3]) continue;
-                for (int k = 0; k < 4; k++)
-                {
-                    const CloudBlob& b = g_cloudBlobs[i][k];
-                    double dx = (cl - b.x) / b.rx;
-                    double dy = ((double)ly - b.y) / b.ry;
-                    double d2 = dx * dx + dy * dy;
-                    if (d2 < 1.0)
-                    {
-                        double f = 1.0 - d2;
-                        acc += b.lum * f * f;             // 边缘柔，中心实
-                    }
-                }
-            }
-            if (acc > 0.001)
-            {
-                int d = (int)(acc * env * s.cloudAmp * 78.0);
-                if (d > 120) d = 120;
-                *R += d; *chanG += d; *B += (int)(d * 0.94);
-            }
+            int ci = (int)(lx - (s.cx - 320));
+            if (ci < 0) ci = 0;
+            if (ci > 639) ci = 639;
+            double c = skyCloud[ci];
+            // V1.2 是 34，但那时底板压暗没现在狠：34 再乘 0.5 的 dim 只剩 ±9，肉眼看不见。
+            // 抬到 60，多云档大约 ±33、雨/阴档 ±50，画面上才有"云"可言。
+            int d = (int)(c * env * s.cloudAmp * 60.0);
+            *R += d; *chanG += d; *B += (int)(d * 0.85);
         }
     }
 }
@@ -2362,6 +2309,7 @@ static void SkyOverlay(BYTE* p, int stride, int width, int height,
 // 原来只允许 上课了/下课了/倒计时 三处，后来加了迷你岛，再后来干脆全要 —— 所以这里直接恒真。
 bool SkyActive()
 {
+    if (g_examOn) return false;     // 考试模式：强制纯色钢板，不画天空也不画天气
     if (!skyEn) return false;       // 总开关：关掉 → 所有岛回到原来的纯色底板
     return true;
 }
@@ -3134,6 +3082,25 @@ R = (int)(R * dim); chanG = (int)(chanG * dim); B = (int)(B * dim);
                 stamp(ro, oldT,     hFontLarge, textColor,   DT_CENTER|DT_VCENTER|DT_SINGLELINE, aOld);
                 stamp(sn, timeStr,  hFontLarge, shadowColor, DT_CENTER|DT_VCENTER|DT_SINGLELINE, aNew);
                 stamp(rn, timeStr,  hFontLarge, textColor,   DT_CENTER|DT_VCENTER|DT_SINGLELINE, aNew);
+            }
+        }
+        // P2：原地换字的交叉渐变（旧字 → 新字，260ms）
+        if (!rolled && g_swapT0 && g_prevBig[0])
+        {
+            double pt2 = (double)(NowMs() - g_swapT0) / 260.0;
+            if (pt2 >= 1.0) { g_swapT0 = 0; g_prevBig[0] = 0; }
+            else
+            {
+                rolled = true;
+                int aOld = (int)(aBig * (1.0 - pt2));
+                int aNew = (int)(aBig * pt2);
+                // 旧字按它原来的位置画（大岛的大字一直是居中的）
+                RECT oc = shapeRect, os = shapeRect;
+                os.left += 2; os.top += 2; os.right += 2; os.bottom += 2;
+                stamp(os, g_prevBig, hFontLarge, shadowColor, DT_CENTER|DT_VCENTER|DT_SINGLELINE, aOld);
+                stamp(oc, g_prevBig, hFontLarge, textColor,   DT_CENTER|DT_VCENTER|DT_SINGLELINE, aOld);
+                stamp(shRect, bigStr, hFontLarge, shadowColor, al2|DT_VCENTER|DT_SINGLELINE, aNew);
+                stamp(textRect, bigStr, hFontLarge, textColor, al2|DT_VCENTER|DT_SINGLELINE, aNew);
             }
         }
         if (!rolled)
@@ -4349,7 +4316,7 @@ void StartTimerThread()
     mm = CreateThread(NULL, 0, TimerThreadProc, NULL, 0, NULL);
 }
 
-BOOL GetNextAlarmTime(FILETIME* pNextTime, AlarmType* pType)
+BOOL GetNextAlarmTime(FILETIME* pNextTime, AlarmType* pType, int* pPeriod)
 {
     if (jj.empty()) return FALSE;
     SYSTEMTIME stNowUtc; GetSystemTime(&stNowUtc);
@@ -4357,6 +4324,7 @@ BOOL GetNextAlarmTime(FILETIME* pNextTime, AlarmType* pType)
     ULONGLONG minDiff = ULLONG_MAX;
     bool found = false;
     AlarmType nextType = ALARM_TYPE_SINGLE;
+    int nextPeriod = -1;
     FILETIME nextFT;
     for (const auto& alarm : jj)
     {
@@ -4377,9 +4345,9 @@ BOOL GetNextAlarmTime(FILETIME* pNextTime, AlarmType* pType)
             ftTarget.dwLowDateTime=(DWORD)uliTarget.LowPart;ftTarget.dwHighDateTime=(DWORD)uliTarget.HighPart;
         }
         ULONGLONG diff = uliTarget.QuadPart - uliCurrent.QuadPart;
-        if (diff < minDiff) { minDiff=diff; nextFT=ftTarget; nextType=alarm.type; found=true; }
+        if (diff < minDiff) { minDiff=diff; nextFT=ftTarget; nextType=alarm.type; nextPeriod=alarm.period; found=true; }
     }
-    if (found) { *pNextTime=nextFT; *pType=nextType; return TRUE; }
+    if (found) { *pNextTime=nextFT; *pType=nextType; if (pPeriod) *pPeriod=nextPeriod; return TRUE; }
     return FALSE;
 }
 
@@ -4387,8 +4355,8 @@ DWORD WINAPI TimerThreadProc(LPVOID lpParam)
 {
     while (true)
     {
-        FILETIME ftNext; AlarmType nextType;
-        if (!GetNextAlarmTime(&ftNext, &nextType))
+        FILETIME ftNext; AlarmType nextType; int nextPeriod = -1;
+        if (!GetNextAlarmTime(&ftNext, &nextType, &nextPeriod))
         {
             if (WaitForSingleObject(kk, 60000) == WAIT_OBJECT_0) return 0;
             continue;
@@ -4408,7 +4376,7 @@ DWORD WINAPI TimerThreadProc(LPVOID lpParam)
             diffMs = (uliNext.QuadPart - uliNow.QuadPart) / 10000;
             if (diffMs < 0) diffMs = 0;
         }
-        PostMessage(hMain, WM_ALARM_TRIGGER, (WPARAM)nextType, 0);
+        PostMessage(hMain, WM_ALARM_TRIGGER, (WPARAM)nextType, (LPARAM)nextPeriod);
         if (WaitForSingleObject(kk, 2000) == WAIT_OBJECT_0) return 0;
     }
     return 0;
@@ -4504,6 +4472,7 @@ void BgmToggle() { if (bgmPause) BgmResume(); else BgmPause(); }
 
 void BgmPlay()
 {
+    if (g_examOn) return;                    // 考试模式：放学音乐也不放
     StartAmp();          // 顺便把底部半圆的耳朵打开（MCI 拿不到 PCM，靠 WASAPI 回环）
     if (!bgmOn) return;
     if (!bgmPath[0]) HomeResolvePath();
@@ -4545,6 +4514,7 @@ void AudioStop() { mciSendStringW(L"close ilsaudio", NULL, 0, NULL); }
 // 独立试听：从文件时长的 pct% 处开始放。固定 80% 音量，不读也不改任何铃音配置。
 static void AudioPreview(int pct)
 {
+    if (g_examOn) return;                    // 考试模式：试听同样禁掉
     if (!nn[0]) AudioResolvePath();
     if (!nn[0]) return;
     if (pct < 0) pct = 0;
@@ -4584,6 +4554,7 @@ static DWORD WINAPI AudioThreadProc(LPVOID p)
 }
 void AudioPlayAsync(AlarmType type)          // 试听：用全局音量
 {
+    if (g_examOn) return;                    // 考试模式：一点声音都不许有
     AudioJob* cw = new AudioJob{ type, -1 };
     HANDLE h = CreateThread(NULL, 0, AudioThreadProc, cw, 0, NULL);
     if (h) CloseHandle(h);      // 不 Join：让它自己放完
@@ -4592,6 +4563,7 @@ void AudioPlayAsync(AlarmType type)          // 试听：用全局音量
 // 到点响铃：带这一节课自己的音量
 void AudioPlayAsyncVol(AlarmType type, int vol)
 {
+    if (g_examOn) return;                    // 考试模式：上下课铃也一起禁掉
     AudioJob* cw = new AudioJob{ type, vol };
     HANDLE h = CreateThread(NULL, 0, AudioThreadProc, cw, 0, NULL);
     if (h) CloseHandle(h);
@@ -4888,6 +4860,7 @@ LONGLONG plyHintUntil = 0;
 //   ④ 节日两段式正在演（islandMode= MODE_HOLIDAY）→ 先别抢，等它演完（见 AnimTick 里 islandMode= MODE_HOLIDAY 的收尾）
 void ShowPlayerIsland()
 {
+    if (g_examOn) return;           // 考试模式：播放器岛也不许弹
     bool grow = (bigH != PLAYER_H || bigW != PLAYER_W);            // 现在的尺寸是不是"播放器尺寸"
     ply = true;
     plyA = 255.0f; plyMix = false;                              // 默认完全不透明；要走过渡再单独置
@@ -5128,6 +5101,9 @@ HFONT sFont = NULL;
 #define ID_BELLDN_VOL_BASE 1220   // 每节课下课铃音量滑块：1220..1230
 static HWND sStatus = NULL;    // 导航栏底部常驻状态
 static std::wstring g_checkMsg;   // 打开设置时自检出来的问题（每行一条，空=全好）
+#define ID_SET_EXAM     1240   // 考试模式开关（作息表页最上面）
+#define ID_SET_EXAM_PWD 1241   // 自定义页：二级密码输入框
+#define ID_SET_EXAM_PWD_SAVE 1242
 #define ID_SET_LOWPERF 1085   // 低配模式勾选
 #define ID_SET_CLOSE 1090
 #define ID_SET_PREV0 1091
@@ -5839,6 +5815,14 @@ void SetSyncControls()
     if (sMsgEndEdit)   SetWindowTextW(sMsgEndEdit,   g_msgEnd);
     if (sSkyRe)     SendMessageW(sSkyRe, BM_SETCHECK,  skyReplay ? BST_CHECKED : BST_UNCHECKED, 0);
     if (sSkyGo)     SendMessageW(sSkyGo, BM_SETCHECK, !skyReplay ? BST_CHECKED : BST_UNCHECKED, 0);
+    if (sExam)      SendMessageW(sExam, BM_SETCHECK, g_examOn ? BST_CHECKED : BST_UNCHECKED, 0);
+#ifdef P0_LOG
+    {
+        FILE* f = fopen("D:/aab/p0.log", "a");
+        if (f) { fprintf(f, "[sync] g_examOn=%d sExam=%p after=%d\n", g_examOn ? 1 : 0, (void*)sExam,
+                         sExam ? (int)SendMessageW(sExam, BM_GETCHECK, 0, 0) : -1); fclose(f); }
+    }
+#endif
     if (sSkyMode[0]) SendMessageW(sSkyMode[0], BM_SETCHECK,  skyEn ? BST_CHECKED : BST_UNCHECKED, 0);
     if (sSkyMode[1]) SendMessageW(sSkyMode[1], BM_SETCHECK, !skyEn ? BST_CHECKED : BST_UNCHECKED, 0);
     // 天空关了，亮度 / 动画那几个控件就没意义了 → 灰掉（看着也明白它们是天空的一部分）
@@ -6047,6 +6031,36 @@ LRESULT CALLBACK SetProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
             RefreshPeriodCombo();
             FillPeriodTimes();
             SetSyncControls();
+            return 0;
+        }
+        if (id == ID_SET_EXAM && HIWORD(wParam) == BN_CLICKED)
+        {
+            bool on = (SendMessageW(sExam, BM_GETCHECK, 0, 0) == BST_CHECKED);
+            if (on && MessageBoxW(hWnd,
+                    L"开启考试模式后：\n\n· 只显示迷你岛时间，其他所有岛都不会弹出\n· 关闭实时天气，底板固定纯色\n· 退出需要从托盘再次进入设置并输入密码\n\n确定开启？",
+                    L"考试模式", MB_YESNO | MB_ICONWARNING) != IDYES)
+            {
+                SendMessageW(sExam, BM_SETCHECK, BST_UNCHECKED, 0);   // 用户反悔，复选框弹回去
+                return 0;
+            }
+            ApplyExamMode(on);
+            // P1：开考之后 GUI 立刻收掉（学生不能再在窗口里点来点去）
+            if (on && stw) DestroyWindow(stw);   // WM_DESTROY 会把 stw 置空
+            return 0;
+        }
+        if (id == ID_SET_EXAM_PWD_SAVE && HIWORD(wParam) == BN_CLICKED)
+        {
+            wchar_t buf[32] = { 0 };
+            GetDlgItemTextW(hWnd, ID_SET_EXAM_PWD, buf, 32);
+            if (wcslen(buf) < 4)
+            {
+                MessageBoxW(hWnd, L"密码至少 4 位。", L"考试模式", MB_OK | MB_ICONWARNING);
+                return 0;
+            }
+            wcscpy_s(g_examPwd, buf);
+            SaveExamCfg();
+            SetDlgItemTextW(hWnd, ID_SET_EXAM_PWD, L"");
+            MessageBoxW(hWnd, L"密码已保存。", L"考试模式", MB_OK | MB_ICONINFORMATION);
             return 0;
         }
         if (id == ID_MSG_SAVE)
@@ -6380,9 +6394,148 @@ LRESULT CALLBACK SetProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
     return DefWindowProcW(hWnd, msg, wParam, lParam);
 }
 
+// ===== 考试模式：状态 / 落地 / 密码闸门（2026-11-16）=====
+static void LoadExamCfg()
+{
+    HKEY k;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, REGKEY, 0, KEY_READ, &k) == ERROR_SUCCESS)
+    {
+        DWORD v = 0, sz = sizeof(v);
+        if (RegQueryValueExW(k, L"ExamMode", NULL, NULL, (LPBYTE)&v, &sz) == ERROR_SUCCESS) g_examOn = (v != 0);
+        wchar_t buf[32] = {0};
+        DWORD bs = (DWORD)sizeof(buf);
+        if (RegQueryValueExW(k, L"ExamPwd", NULL, NULL, (LPBYTE)buf, &bs) == ERROR_SUCCESS)
+            if (buf[0]) wcscpy_s(g_examPwd, buf);
+        RegCloseKey(k);
+    }
+}
+static void SaveExamCfg()
+{
+    HKEY k;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, REGKEY, 0, NULL, 0, KEY_SET_VALUE, NULL, &k, NULL) == ERROR_SUCCESS)
+    {
+        DWORD v = g_examOn ? 1 : 0;
+        RegSetValueExW(k, L"ExamMode", 0, REG_DWORD, (LPBYTE)&v, sizeof(v));
+        RegSetValueExW(k, L"ExamPwd", 0, REG_SZ, (LPBYTE)g_examPwd, (DWORD)((wcslen(g_examPwd) + 1) * sizeof(wchar_t)));
+        RegCloseKey(k);
+    }
+}
+
+// 把岛强行摆成"迷你岛定格"：不管现在是大岛/小岛/变身中，一律立刻变成迷你岛。
+// 考试模式下这是唯一的形态，所以不走动画（学生看到"岛在收"没有意义）。
+static void ForceNotchOnly()
+{
+    nt = true; nv = 255; na = NowMs();
+    pp = false; hh = false; af = false;
+    islandW = NOTCH_WIDTH; islandH = NOTCH_HEIGHT;
+    islandY = NOTCH_Y; islandX = (B - islandW) / 2;
+    sf = 0.0f; sf0 = 0.0f; sf1 = 0.0f;
+    bigH = ISLAND_HEIGHT; bigW = NOTCH_WIDTH;
+    islandMode = MODE_NOTCH_HOLD;
+    hideAtMs = 0;                       // 不自动收
+    ComputeCanvasSize();
+    UpdateIslandDisplay(hMain, 1.0f, 255);
+}
+
+void ApplyExamMode(bool on)
+{
+    g_examOn = on;
+    SaveExamCfg();
+    if (on)
+    {
+        // 开考那一刻可能有铃声/音乐正在放 —— 立刻停掉，别让它响完
+        BgmStop();
+        mciSendStringW(L"close ilsaudio", NULL, 0, NULL);
+        mciSendStringW(L"close ilstry", NULL, 0, NULL);
+        ForceNotchOnly();
+    }
+    else    UpdateIslandDisplay(hMain, 1.0f, 255);
+    if (sExam) SendMessageW(sExam, BM_SETCHECK, on ? BST_CHECKED : BST_UNCHECKED, 0);
+    SetSyncControls();
+}
+
+// 密码输入框：一个独立的模态小窗（标准控件，和设置窗口一致）
+static bool g_pwdDone = false;
+static LRESULT CALLBACK PwdProc(HWND h, UINT m, WPARAM wParam, LPARAM lParam)
+{
+    switch (m)
+    {
+    case WM_CREATE:
+    {
+        HINSTANCE hi = GetModuleHandleW(NULL);
+        HFONT f = GetCachedFont(10, false);
+        HWND st = CreateWindowExW(0, L"STATIC", L"请输入考试模式的二级密码", WS_CHILD | WS_VISIBLE,
+                                  18, 14, 340, 22, h, NULL, hi, NULL);
+        HWND ed = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+                                  WS_CHILD | WS_VISIBLE | ES_PASSWORD | ES_NUMBER | ES_AUTOHSCROLL,
+                                  18, 44, 340, 28, h, (HMENU)2001, hi, NULL);
+        HWND ok = CreateWindowExW(0, L"BUTTON", L"确定", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
+                                  196, 88, 76, 30, h, (HMENU)IDOK, hi, NULL);
+        HWND ca = CreateWindowExW(0, L"BUTTON", L"取消", WS_CHILD | WS_VISIBLE,
+                                  282, 88, 76, 30, h, (HMENU)IDCANCEL, hi, NULL);
+        SendMessageW(st, WM_SETFONT, (WPARAM)f, TRUE);
+        SendMessageW(ed, WM_SETFONT, (WPARAM)f, TRUE);
+        SendMessageW(ok, WM_SETFONT, (WPARAM)f, TRUE);
+        SendMessageW(ca, WM_SETFONT, (WPARAM)f, TRUE);
+        SendMessageW(ed, EM_SETLIMITTEXT, 15, 0);
+        SetFocus(ed);
+        return 0;
+    }
+    case WM_COMMAND:
+        if (LOWORD(wParam) == IDOK)
+        {
+            wchar_t buf[32] = {0};
+            GetDlgItemTextW(h, 2001, buf, 32);
+            if (wcscmp(buf, g_examPwd) == 0) { g_pwdDone = true; DestroyWindow(h); }
+            else MessageBoxW(h, L"密码不正确。", L"考试模式", MB_OK | MB_ICONWARNING);
+            return 0;
+        }
+        if (LOWORD(wParam) == IDCANCEL) { g_pwdDone = true; DestroyWindow(h); return 0; }
+        break;
+    case WM_CLOSE: g_pwdDone = true; DestroyWindow(h); return 0;
+    }
+    return DefWindowProcW(h, m, wParam, lParam);
+}
+static bool AskExamPassword(HWND owner)
+{
+    static bool regd = false;
+    if (!regd)
+    {
+        regd = true;
+        WNDCLASSW wc = {0};
+        wc.lpfnWndProc = PwdProc;
+        wc.hInstance = GetModuleHandleW(NULL);
+        wc.lpszClassName = L"MobileExamPwd";
+        wc.hbrBackground = GetSysColorBrush(COLOR_BTNFACE);
+        wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+        RegisterClassW(&wc);
+    }
+    g_pwdDone = false;
+    const int W = 392, H = 168;
+    RECT wa = {0};
+    SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
+    int x = wa.left + (wa.right - wa.left - W) / 2;
+    int y = wa.top + (wa.bottom - wa.top - H) / 2;
+    HWND dlg = CreateWindowExW(WS_EX_DLGMODALFRAME, L"MobileExamPwd", L"考试模式 — 需要密码",
+                               WS_POPUP | WS_CAPTION | WS_SYSMENU, x, y, W, H,
+                               owner, NULL, GetModuleHandleW(NULL), NULL);
+    if (!dlg) return false;
+    ShowWindow(dlg, SW_SHOW);
+    SetForegroundWindow(dlg);
+    SetFocus(GetDlgItem(dlg, 2001));
+    MSG msg;
+    while (!g_pwdDone && GetMessageW(&msg, NULL, 0, 0))
+    {
+        if (!IsDialogMessageW(dlg, &msg)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
+    }
+    if (IsWindow(dlg)) DestroyWindow(dlg);
+    return true;
+}
+
 void ShowSettingsWindow(HWND owner)
 {
-    (void)owner;
+    // 考试模式：进设置先过密码闸门（只有"还没开窗"时才拦，已经开着的直接前置）
+    if (!stw && g_examOn && !AskExamPassword(owner)) return;
     if (stw) { ShowWindow(stw, SW_RESTORE); SetForegroundWindow(stw); return; }
     static bool reg = false;
     if (!reg)
@@ -6442,11 +6595,16 @@ void ShowSettingsWindow(HWND owner)
 
     // ---------- 页 0：作息表 ----------
     gSetPage = 0;
-    SetCtl(L"STATIC", L"选择一套作息", SS_LEFT, CX, 18, 320, 24, -1);
-    sTbl[0] = SetCtl(L"BUTTON", L"初四夏季作息", BS_AUTORADIOBUTTON | WS_GROUP, CX + 8, 62, 320, 26, ID_TBL_OLD);
-    sTbl[1] = SetCtl(L"BUTTON", L"冬季作息",     BS_AUTORADIOBUTTON,            CX + 8, 100, 320, 26, ID_TBL_WINTER);
-    sTbl[2] = SetCtl(L"BUTTON", L"初四冬季作息", BS_AUTORADIOBUTTON,            CX + 8, 138, 320, 26, ID_TBL_W4);
-    SetCtl(L"STATIC", L"换作息后，倒计时和铃声都按新的时间表走。", SS_LEFT, CX, 186, 600, 24, -1);
+    // ===== 考试模式（要求"一定放最上面"）=====
+    sExam = SetCtl(L"BUTTON", L"考试模式（只保留迷你岛，屏蔽其他所有岛）", BS_AUTOCHECKBOX,
+                   CX, 6, 640, 30, ID_SET_EXAM);
+    SetCtl(L"STATIC", L"开启后只显示迷你岛时间，其余岛一律不弹；实时天气关闭、底板固定纯色。关闭需从托盘重新进设置并输入密码。",
+           SS_LEFT, CX + 4, 38, 760, 20, -1);
+    SetCtl(L"STATIC", L"选择一套作息", SS_LEFT, CX, 82, 320, 24, -1);
+    sTbl[0] = SetCtl(L"BUTTON", L"初四夏季作息", BS_AUTORADIOBUTTON | WS_GROUP, CX + 8, 126, 320, 26, ID_TBL_OLD);
+    sTbl[1] = SetCtl(L"BUTTON", L"冬季作息",     BS_AUTORADIOBUTTON,            CX + 8, 164, 320, 26, ID_TBL_WINTER);
+    sTbl[2] = SetCtl(L"BUTTON", L"初四冬季作息", BS_AUTORADIOBUTTON,            CX + 8, 202, 320, 26, ID_TBL_W4);
+    SetCtl(L"STATIC", L"换作息后，倒计时和铃声都按新的时间表走。", SS_LEFT, CX, 250, 600, 24, -1);
 
     // ---------- 页 1：时间提醒 ----------
     gSetPage = 1;
@@ -6569,6 +6727,14 @@ void ShowSettingsWindow(HWND owner)
     if (sCdLabel) SendMessageW(sCdLabel, EM_SETLIMITTEXT, 20, 0);
     SetCtl(L"BUTTON", L"开始", BS_PUSHBUTTON, CX + 334, 616, 80, 30, ID_CD_START);
 
+    // ---- 考试模式密码（2026-11-16）----
+    SetCtl(L"STATIC", L"考试模式密码", SS_LEFT, CX, 672, 110, 22, -1);
+    sExamPwdEdit = SetCtl(L"EDIT", L"", WS_BORDER | ES_PASSWORD | ES_NUMBER | ES_AUTOHSCROLL,
+                          CX + 114, 668, 150, 26, ID_SET_EXAM_PWD);
+    if (sExamPwdEdit) SendMessageW(sExamPwdEdit, EM_SETLIMITTEXT, 15, 0);
+    SetCtl(L"BUTTON", L"保存密码", BS_PUSHBUTTON, CX + 274, 666, 96, 28, ID_SET_EXAM_PWD_SAVE);
+    SetCtl(L"STATIC", L"（默认 426426；改完点保存，下次进设置就用新密码）", SS_LEFT, CX + 380, 672, 380, 20, -1);
+
     // ---------- 页 3：主题 ----------
     gSetPage = 3;
     SetCtl(L"STATIC", L"主题", SS_LEFT, CX, 18, 320, 24, -1);
@@ -6662,6 +6828,7 @@ void ShowTrayMenu(HWND hWnd)
 
 void ShowMessageIsland(const wchar_t* text, int extraW, const wchar_t* small, bool sched)
 {
+    if (g_examOn) return;           // 考试模式：消息岛一律不许弹
     // 2026-11-13：schedMode 改成由调用方传进来。
     // 原来只有 ShowScheduleIsland 里 `schedMode = true`，**没有任何一处置回 false** ——
     // 注释写着"ShowMessageIsland 里会重置"，其实根本没写。
@@ -6720,7 +6887,13 @@ void ShowMessageIsland(const wchar_t* text, int extraW, const wchar_t* small, bo
 void ShowScheduleIsland()
 {
     int nh = 0, nm = 0, np = -1;
-    if (NextClassStart(&nh, &nm, &np))
+#ifdef P2_TEST
+    nh = 21; nm = 5; np = 0;                  // 测试用：假装下一节是 21:05
+    bool gotNext = true;
+#else
+    bool gotNext = NextClassStart(&nh, &nm, &np);
+#endif
+    if (gotNext)
     {
         SYSTEMTIME st; GetLocalTime(&st);
         int wd = st.wDayOfWeek;             // 0=周日
@@ -6731,6 +6904,48 @@ void ShowScheduleIsland()
         else if (np >= 0 && np < (int)(sizeof(ffA)/sizeof(ffA[0])))
                  swprintf_s(big, L"%s  %02d:%02d", ffA[np], nh, nm);
         else     swprintf_s(big, L"%02d:%02d", nh, nm);
+        // P2：如果「下课了」还挂在屏幕上，就**原地换字**——
+        // 底板、尺寸、圆角、天空一律不动，只把大字交叉渐变过去。
+        // 宽度不够（课表比"下课了/时间"更宽）才退回 ShowMessageIsland 走放大动画。
+        if (!g_examOn && islandMode == MODE_BIG_HOLD && !ply && bigH == ISLAND_HEIGHT && !he)
+        {
+            // 只**量**宽度，不碰 bigW/画布 —— 之前借 FitBigWidth 会顺手改画布，岛会横跳 4px
+            int needW = 0;
+            {
+                HDC dc = GetDC(NULL);
+                HGDIOBJ oldF = SelectObject(dc, GetCachedFont((int)(ISLAND_HEIGHT * 0.62), true));
+                SIZE s1 = { 0, 0 }, s2 = { 0, 0 };
+                GetTextExtentPoint32W(dc, big, (int)wcslen(big), &s1);
+                SelectObject(dc, GetCachedFont((int)(ISLAND_HEIGHT * 0.20), false));
+                const wchar_t* lb2 = L"下节课是";
+                GetTextExtentPoint32W(dc, lb2, (int)wcslen(lb2), &s2);
+                SelectObject(dc, oldF);
+                ReleaseDC(NULL, dc);
+                needW = (s1.cx > s2.cx ? s1.cx : s2.cx) + 120;
+                int lo2 = B * 22 / 100, hi2 = B * 92 / 100;
+                if (needW < lo2) needW = lo2;
+                if (needW > hi2) needW = hi2;
+            }
+            if (needW <= islandW + 2)
+            {
+                if (hh) wcscpy_s(g_prevBig, gg);            // 旧大字是消息
+                else                                              // 旧大字是时间
+                {
+                    SYSTEMTIME st; GetLocalTime(&st);
+                    swprintf_s(g_prevBig, L"%02d:%02d", st.wHour, st.wMinute);
+                }
+                wcscpy_s(gg, big);
+                wcscpy_s(infoCustom, L"下节课是");
+                schedMode = true;
+                hh = true;
+                g_swapT0 = NowMs();
+                g_rollUntil = NowMs() + 320;                 // 借用时间滚动那条 16ms 重绘定时器
+                SetTimer(hMain, 79, 16, NULL);
+                hideAtMs = NowMs() + DISPLAY_DURATION_MS;    // 换字后重新给满 5 秒
+                UpdateIslandDisplay(hMain, 1.0f, 255);
+                return;
+            }
+        }
         ShowMessageIsland(big, 0, L"下节课是", true);
         // 靠左排版由 ShowMessageIsland 的 sched 参数负责（以前在这里补一句 schedMode=true，
         // 但因为没人置回 false，弹过一次就永远靠左了）
@@ -6945,7 +7160,8 @@ void NotchHoldTick()
     int nowSec = (int)(NowMs() / 1000);
     if (nowSec != ai) { ai = nowSec; }
     int dimA = 255 * notchA / 100;                       // 我可调（设置里那条"静止后透明度"）
-    int target = (NowMs() - na > NOTCH_DIM_MS) ? dimA : 255;
+    // 考试模式：除了时间走字，别的什么都不许变 —— 不做"变淡"
+    int target = g_examOn ? 255 : ((NowMs() - na > NOTCH_DIM_MS) ? dimA : 255);
     if (nv != target)
     {
         int d = target - nv, step = 10;
@@ -6986,17 +7202,26 @@ static int CurBellPeriod(AlarmType type)
 }
 
 // 到点这一下到底响不响：总开关 → 该节课的对应铃开关
-static int BellVolume(AlarmType type)
+static int BellVolume(AlarmType type, int period)
 {
     if (!fuck) return -1;
-    int i = CurBellPeriod(type);
-    if (i < 0 || i >= 11) return (type == ALARM_TYPE_CLASS_END) ? FUCK : ab;   // 定位不到用全局
+    // P3：以前"定位不到这一节"就退回全局音量 —— 那等于绕过勾选框。
+    // 现在：优先用闹钟自带的那一节；实在没有才按时间反查；都对不上就**不响**。
+    int i = (period >= 0 && period < 11) ? period : CurBellPeriod(type);
+#ifdef P0_LOG
+    {
+        SYSTEMTIME st0; GetLocalTime(&st0);
+        FILE* f = fopen("D:/aab/p0.log", "a");
+        if (f) { fprintf(f, "[bell] %02d:%02d type=%d period=%d use=%d bellDn=%d bellUp=%d", st0.wHour, st0.wMinute, (int)type, period, i, (i >= 0 && i < 11) ? (bellDn[i] ? 1 : 0) : -1, (i >= 0 && i < 11) ? (bellUp[i] ? 1 : 0) : -1); fputc(10, f); fclose(f); }
+    }
+#endif
+    if (i < 0 || i >= 11) return -1;      // 定位不到就不响（不再回退全局音量）
     bool on = (type == ALARM_TYPE_CLASS_START) ? bellUp[i] : bellDn[i];
     if (!on) return -1;
     return (type == ALARM_TYPE_CLASS_START) ? bellUpVol[i] : bellDnVol[i];
 }
 
-void TriggerAlarmByTimer(AlarmType type)
+void TriggerAlarmByTimer(AlarmType type, int period)
 {
     if (gSelfTest) return;      // 自检跑着的时候别让真实闹钟插进来（会把播放器那步顶掉）
     SYSTEMTIME st; GetLocalTime(&st);
@@ -7005,7 +7230,7 @@ void TriggerAlarmByTimer(AlarmType type)
     N = curMin;
     // 2026-10-13 我改回去了：放学（今天最后一节课下课）**照常敲下课铃**，
     // 《回家》挪到固定 19:30 单独播（见 case 10 里的 BGM_HOUR/BGM_MIN）。
-    int bv = BellVolume(type);
+    int bv = BellVolume(type, period);
     if (bv > 0)
         AudioPlayAsyncVol(type, bv);    // 后台放音：别让 MCI 的启动耗时挡住岛的动画
     // bv<=0：这一节这个铃关掉了（或音量 0），画面照常弹
@@ -7106,6 +7331,7 @@ void TriggerAlarmManual(AlarmType type)
 
 void TriggerAlarm(AlarmType type)
 {
+    if (g_examOn) return;           // 考试模式：铃声照响（在调用方），但岛不弹
     // 闹钟类一律配天空 —— 包括「立即测试」：它就是"预览真实闹钟长什么样"的入口，
     // 不给的话测试时看到的是纯色底板，和实际弹出来的效果对不上
     //（我 2026-10-16 看冒烟时说"弹到一半动画消失、变成纯黑背景"就是这个）。
@@ -7338,7 +7564,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
     }
 
     case WM_ALARM_TRIGGER:
-        TriggerAlarmByTimer((AlarmType)wParam);
+        TriggerAlarmByTimer((AlarmType)wParam, (int)lParam);
         break;
 
     case WM_HOTKEY:
@@ -7503,7 +7729,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
                 if (!alarm.enabled) continue;       // 没打钩的时段一律不响、不弹
                 if (alarm.hour==st.wHour && alarm.minute==st.wMinute)
                 {
-                    TriggerAlarmByTimer(alarm.type);
+                    TriggerAlarmByTimer(alarm.type, alarm.period);
                     break;
                 }
             }
@@ -7703,6 +7929,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     z = true;
     LoadPerfCfg();
     LoadAudioCfg();
+    LoadExamCfg();          // 考试模式：开机就得知道，学生重启也躲不掉
     LoadMsgCfg();
     LoadSkyCfg();
     LoadWxCfg();

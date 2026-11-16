@@ -13,8 +13,8 @@
 1 24 "app.manifest"
 
 VS_VERSION_INFO VERSIONINFO
- FILEVERSION    1,2,0,0
- PRODUCTVERSION 1,2,0,0
+ FILEVERSION    1,2,1,0
+ PRODUCTVERSION 1,2,1,0
  FILEFLAGSMASK  0x3fL
  FILEFLAGS      0x0L
  FILEOS         0x40004L
@@ -27,11 +27,11 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "mobile"
             VALUE "FileDescription",  "mobile"
-            VALUE "FileVersion",      "1.2.0.0"
+            VALUE "FileVersion",      "1.2.1.0"
             VALUE "InternalName",     "mobile"
             VALUE "OriginalFilename", "mobile-v1.2-Turbo.exe"
             VALUE "ProductName",      "mobile Turbo"
-            VALUE "ProductVersion",   "1.2.0.0"
+            VALUE "ProductVersion",   "1.2.1.0"
         END
     END
     BLOCK "VarFileInfo"
