@@ -23,12 +23,12 @@ BEGIN
     BEGIN
         BLOCK "080404b0"
         BEGIN
-            VALUE "CompanyName",      "mobile"
-            VALUE "FileDescription",  "mobile"
+            VALUE "CompanyName",      "Mobile-Island"
+            VALUE "FileDescription",  "Mobile-Island"
             VALUE "FileVersion",      "1.2.0.0"
-            VALUE "InternalName",     "mobile"
+            VALUE "InternalName",     "Mobile-Island"
             VALUE "OriginalFilename", "mobile-v1.2.exe"
-            VALUE "ProductName",      "mobile"
+            VALUE "ProductName",      "Mobile-Island"
             VALUE "ProductVersion",   "1.2.0.0"
         END
     END
